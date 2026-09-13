@@ -221,14 +221,14 @@ Read these before building. Two are direct obstacles; several are bounty candida
 | **2407** | `matchesRegex` compiles to `new RegExp(...).test(...)`, rejected by the Condition validator and interpreter | **Do not use `matchesRegex` in Conditions** — it is broken |
 | **2408** | With `failOnError: false`, a reverted `web3/write-contract` finalises as `success` with no hash and no error | **Undermines the "auditable record" premise.** Strong bounty candidate |
 | **2431** | `validate_workflow` passes a write-contract node whose signer routing is unset | Validate with a real execute, not just validate_workflow |
-| **2395** | export bounded direct-execution receipt evidence as JSON | **We want this** for the receipt bundle. Strong bounty candidate |
+| **2395** | export bounded direct-execution receipt evidence as JSON | **Still open but labelled `accepted`** and carrying 4 comments — the strongest bounty candidate, because acceptance means a maintainer already wants the shape. Design confirmed: read-only `POST /api/execute/receipts/export` taking `{ executionIds }` (≤50, ordered) and returning versioned JSON of allowlisted receipt fields, excluding raw payloads and credentials. Agreed with our receipt bundle exactly |
 | **2398** | Permission Cards for agent actions | Great narrative, large scope. Not us |
 | **2329** | add a Lucid Agents connector | Already filed by a competitor |
 | **2426** | accept raw calldata on `POST /api/execute/contract-call` | Useful escape hatch if our ABI path is blocked |
 | **2359** | template tokens inside array config fields are never rendered but always reported | Avoid templating inside arrays |
 | **2373** | a held idempotency key is never released once the reconciler proves definite failure | Affects retry design |
 | **2380** | README docs section: 3 of 5 links 404 + a `keeperhub/` path prefix that does not exist | Trivial, low value as a bounty |
-| — | `discover-plugins` fails on Windows (absolute path is not a valid ESM specifier — blocks dev and build) | **We are on Windows 11.** See §4.1 — either fix it (bounty) or route around it |
+| ~~—~~ | ~~`discover-plugins` fails on Windows~~ | **RESOLVED — issue was stale.** `scripts/discover-plugins.ts:172` now uses `pathToFileURL(filePath).href` and exits 0 on Windows. See §4.1 for the two failures that *are* real |
 
 ---
 
@@ -236,24 +236,64 @@ Read these before building. Two are direct obstacles; several are bounty candida
 
 Each has a concrete test. Do not write feature code until §4.1 and §4.2 are answered.
 
-### 4.1 Does KeeperHub's plugin toolchain work on Windows? (blocks everything)
+### 4.1 Does KeeperHub's plugin toolchain work on Windows? — **RESOLVED: use WSL2**
 
-We are on Windows 11. An open issue reports `discover-plugins` failing on Windows because an absolute path is not a valid ESM specifier, which blocks dev *and* build. A related issue (#2419) reports `check:api-docs` writing Windows path separators into a tracked artifact.
+Verified empirically against repo HEAD `f8c8f18` on Windows 11 (Node v24.14.1, pnpm 10.33.3).
 
-**Test:** clone the repo, `pnpm install`, run `pnpm create-plugin` and `pnpm discover-plugins`, then `pnpm type-check` and `pnpm test`.
+**The issue I planned around is stale.** `discover-plugins` works — `scripts/discover-plugins.ts:172` now uses `pathToFileURL(filePath).href`. #2419 does not reproduce either. `pnpm install`, `pnpm discover-plugins`, `pnpm type-check` and `pnpm check:api-docs` all exit 0.
 
-**Decide:** if it fails, choose one —
-- (a) **WSL2 or Docker Compose** for the KeeperHub repo only. Fastest path, keeps the main track moving. Recommended.
-- (b) **Fix it as the bounty PR.** Attractive because we need it anyway, it is scoped, and it unblocks every Windows contributor. But it burns D1 and the bounty is only $500 for two winners.
-- Recommendation: **(a) first, always.** Evaluate (b) on D4 only if the main track is ahead of schedule.
+**Two failures are real, and one of them is in production code:**
 
-### 4.2 Does the Request Network API work on a testnet?
+| Command | Result | Root cause |
+|---|---|---|
+| `pnpm install` | works | — |
+| `pnpm discover-plugins` | works | 39 integrations, 481 steps, 26 protocols |
+| `pnpm type-check` | works | `tsgo --noEmit` |
+| `pnpm check:api-docs` | works | zero backslashes written |
+| `pnpm check` | **broken** | 2248 errors, **all** category `format`, zero lint errors |
+| `pnpm test` | **broken** | `spawn ENAMETOOLONG` — 195 failures from one cause |
 
-The docs list Sepolia `11155111` with FAU/USDC/USDT as a supported testnet, but the `secure-payments` flow is not documented as testnet-capable. This changes the demo's funding story.
+1. **`pnpm check` — CRLF.** Git for Windows ships `core.autocrlf=true` in the *system* gitconfig, and the repo has no `.gitattributes` and no Biome `lineEnding`, so Biome expects LF and every file is CRLF. Proven by copying one file with CRLF (format error) and with LF (clean); 40/40 sampled `.ts` files contain CR bytes.
 
-**Test:** create a Client ID, a payment destination, and a payment on Sepolia. If the API is mainnet-only, create one on Base with a **small real amount** (a few dollars) and treat it as the cost of a credible demo.
+2. **`pnpm test` — ENAMETOOLONG.** `sandbox-child-source.test.ts` (107/151) and `code-run-code.test.ts` (88/94) both do `spawn(process.execPath, ["-e", CHILD_SOURCE])` with ~98KB modules. The Windows argv ceiling measured at **32700 chars OK / 32768 ENAMETOOLONG**. **This affects production code, not just tests:** `plugins/code/steps/run-code.ts:157` and `sandbox/src/run-code.ts:141` use the same pattern.
 
-**Fallback if RN is mainnet-only or blocked:** use RN for **invoice creation and the signed webhook** (read-only + webhook side), and run all KeeperHub **value movement on Sepolia/Base Sepolia**. The integration remains real; only the settlement leg is simulated. Be candid about this in the submission's "what still breaks" answer — candour there "has never hurt a submission" per the organizers.
+3. **`pnpm create-plugin` scaffolds, then crashes.** `scripts/create-plugin.ts:274` calls `execFileSync("pnpm", ["discover-plugins"])`, and on Windows `pnpm` → ENOENT, `pnpm.cmd` → EINVAL; only `shell: true` works. Files are written *before* that line, so you get the plugin plus `Error: spawnSync pnpm ENOENT` and exit 1. **Workaround: run `pnpm discover-plugins` manually afterwards.** Also note the wizard is `@inquirer/prompts`, TTY-only — it must be run in a real terminal, not piped.
+
+**Decision: WSL2.** It is already installed (Ubuntu, Default Version 2), and **CI is ubuntu-only — 79 jobs, zero Windows** — so the PR has to pass on Linux regardless. Native Windows is viable but needs three workarounds (`core.autocrlf false` *before* cloning; manual `discover-plugins`; accept 195 failures) and gives us nothing. Docker is the weakest option: `docker` and `make` are both absent from the Windows PATH.
+
+**Contributor rules that shape the PR** (from `CONTRIBUTING.md`, `AGENTS.md` — read these before writing code):
+- **PRs target `staging`, not `main`.** Required before a PR: `pnpm check` and `pnpm type-check`.
+- Branch naming: `feat/KEEP-123-x` or `fix/issue-NNN-x`. Conventional commits.
+- **`ISSUES.md` policy: a behaviour change needs an issue carrying `accepted` before the PR is written** — CI job `pr-issue-link` fails PRs without it. This is why #2395 is the bounty target: it already has `accepted`.
+- Plugin rules: **no SDK dependencies (use `fetch`)**, no `dependencies` field in the plugin manifest, `"use step"` files must not export extra functions, and shared logic goes in `*-core.ts`.
+- **No Windows or WSL guidance exists anywhere in the repo.** A short docs contribution here would be genuinely useful and is a cheap second bounty.
+
+**Unresolved:** a full `pnpm test` tally (913 files at `fileParallelism: false` exceeded the run budget) and a live interactive `create-plugin` run (needs a real console). Both are unknown rather than assumed.
+
+
+### 4.2 Does the Request Network API work on a testnet? — **Sepolia is supported; use FAU, not USDC**
+
+Sepolia `11155111` is a supported payment-destination network, and Request Network's own `POST /v2/secure-payments` examples use `@eip155:11155111`. Nothing states a mainnet-only restriction for secure payments.
+
+**But the Sepolia token to use is FAU, not USDC.** Probed the published token list (747 tokens) for `sepolia`:
+
+| Currency id | Symbol | Decimals | Address |
+|---|---|---|---|
+| **`FAU-sepolia`** | FAU | 18 | `0x370DE27fdb7D1Ff1e1BaA7D11c5820a324Cf623C` |
+| `fUSDC-sepolia` | fUSDC | 6 | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
+| `fUSDT-sepolia` | fUSDT | 6 | `0xF046b3CA5ae2879c6bAcC4D42fAF363eE8379F78` |
+| `ETH-sepolia-sepolia` | ETH-sepolia | 18 | `0xbb3546497a53cd710beb11b84c5240327f145bcb` |
+
+Request Network's own testnet examples use **FAU** and **`ETH-sepolia-sepolia`** — never USDC-on-Sepolia. Sepolia USDC at `0x1c7D…7238` is Circle's test token; it reconciles to `fUSDC-sepolia` in the token list, not to `USDC-sepolia`. **`USDC-sepolia` does not exist in the list at all.**
+
+**Consequence for the demo:** a payment destination must be registered in a token that exists in Request Network's list. If the Sepolia USDC we already hold cannot be registered as a destination, the options are, in order:
+1. Register the destination on Sepolia in **FAU** and fund FAU (their docs' canonical testnet path).
+2. Register on **Base** with `USDC-base` (real USDC, `0x8335…2913`) for a few dollars, and keep all KeeperHub value movement on Sepolia. Costs a small real amount.
+3. Use **Base Sepolia** (`USDC-base-sepolia`, chain `84532`) and fund that instead — note we are currently unfunded there.
+
+**Test:** create a destination in the dashboard and confirm the token it accepts, then confirm `GET /v2/currencies` returns it with the Client ID configured (the endpoint 401s for anonymous callers, so it must be probed authenticated).
+
+**Fallback if no testnet destination is workable:** use RN for **invoice creation and the signed webhook** and run all KeeperHub **value movement on Sepolia**. The integration stays real; only the settlement leg is simulated. Say so plainly in the submission's "what still breaks" answer — the organisers note candour there "has never hurt a submission".
 
 ### 4.3 Remaining unknowns
 
