@@ -30,35 +30,94 @@ export interface Config {
   };
 }
 
-const EnvSchema = z.object({
-  RN_CLIENT_ID: z.string().min(1).optional(),
-  RN_WEBHOOK_SECRET: z.string().min(1).optional(),
-  RN_DESTINATION_ID: z.string().min(1).optional(),
-  RN_API_BASE: z.string().url().default('https://api.request.network'),
-  RN_AUTH_BASE: z.string().url().default('https://auth.request.network'),
+/**
+ * An empty value in a .env template means "not set", not "invalid".
+ *
+ * `.env.example` ships every key with an empty value so the operator can see
+ * what exists. Without this, copying the template produces a wall of validation
+ * errors for keys the operator has simply not filled in yet.
+ *
+ * The placement of `.optional()` is load-bearing. `blankAsUnset` turns `''` into
+ * `undefined`, so the inner schema is what must accept undefined:
+ *
+ *   optional(schema)       -> z.preprocess(blankAsUnset, schema.optional())
+ *   withDefault(schema)    -> z.preprocess(blankAsUnset, schema)   // inner .default() applies
+ *
+ * Putting `.optional()` on the outside instead would (a) fail every blank key with
+ * "Required", because ZodOptional sees `''` as defined and forwards it to a
+ * preprocess that then yields undefined, and (b) discard an inner `.default()`.
+ * Both mistakes are covered by tests/env.test.ts.
+ */
+const blankAsUnset = (value: unknown): unknown =>
+  typeof value === 'string' && value.trim() === '' ? undefined : value;
 
-  KH_API_KEY: z.string().min(1).optional(),
-  KH_API_BASE: z.string().url().default('https://app.keeperhub.com/api'),
-  KH_MCP_URL: z.string().url().default('https://app.keeperhub.com/mcp'),
-  KH_ORG_WALLET: z.string().min(1).optional(),
-  KH_CHAIN_ID: z.string().regex(/^\d+$/, 'KH_CHAIN_ID must be a numeric chain id as a string').default('11155111'),
+const optional = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess(blankAsUnset, schema.optional());
 
-  BRIDGE_PORT: z.coerce.number().int().positive().max(65535).default(8787),
-  BRIDGE_PUBLIC_URL: z.string().url().optional(),
-  MATCH_AUTO_APPROVE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.85),
+const withDefault = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess(blankAsUnset, schema) as unknown as z.ZodType<z.output<T>>;
+
+/** Exported so tests can exercise the blank-value handling without touching process.env. */
+export const EnvSchema = z.object({
+  RN_CLIENT_ID: optional(z.string().min(1)),
+  RN_WEBHOOK_SECRET: optional(z.string().min(1)),
+  RN_DESTINATION_ID: optional(z.string().min(1)),
+  RN_API_BASE: withDefault(z.string().url().default('https://api.request.network')),
+  RN_AUTH_BASE: withDefault(z.string().url().default('https://auth.request.network')),
+
+  KH_API_KEY: optional(z.string().min(1)),
+  KH_API_BASE: withDefault(z.string().url().default('https://app.keeperhub.com/api')),
+  KH_MCP_URL: withDefault(z.string().url().default('https://app.keeperhub.com/mcp')),
+  KH_ORG_WALLET: optional(z.string().min(1)),
+  KH_CHAIN_ID: withDefault(
+    z
+      .string()
+      .regex(/^\d+$/, 'KH_CHAIN_ID must be a numeric chain id as a string')
+      .default('11155111'),
+  ),
+
+  BRIDGE_PORT: withDefault(z.coerce.number().int().positive().max(65535).default(8787)),
+  BRIDGE_PUBLIC_URL: optional(z.string().url()),
+  MATCH_AUTO_APPROVE_THRESHOLD: withDefault(
+    z.coerce.number().min(0).max(1).default(0.85),
+  ),
 });
 
-/** Reads .env into process.env if present. Node 24 ships this; no dotenv needed. */
-function loadDotEnv(path: string): void {
-  try {
-    process.loadEnvFile(path);
-  } catch {
-    // No .env file is a normal state — the operator may export vars instead.
+/**
+ * Reads .env into process.env. Node 24 ships this; no dotenv needed.
+ *
+ * The search order matters. The template lives at the repository root, so an
+ * operator who copies it once should not have to duplicate it per package. We
+ * look in the working directory first, then one level up, so the bridge works
+ * whether it is started from `bridge/` or from the repository root.
+ *
+ * Override with TRUEUP_ENV=/path/to/file when neither fits.
+ */
+function loadDotEnv(candidates: readonly string[]): string | undefined {
+  for (const candidate of candidates) {
+    try {
+      process.loadEnvFile(candidate);
+      return candidate;
+    } catch {
+      // Try the next candidate. A missing file is normal — vars may be exported.
+    }
   }
+  return undefined;
 }
 
-export function loadConfig(envPath = '.env'): Config {
-  loadDotEnv(envPath);
+/** The .env candidates, in priority order. */
+export function envCandidates(): string[] {
+  const explicit = process.env['TRUEUP_ENV'];
+  return [...(explicit === undefined || explicit === '' ? [] : [explicit]), '.env', '../.env'];
+}
+
+export function loadConfig(envPath?: string): Config {
+  const loaded = loadDotEnv(envPath === undefined ? envCandidates() : [envPath]);
+  if (loaded !== undefined) {
+    // Recorded so the readiness output can name the file it actually used —
+    // reading a different .env than the operator edited is a confusing failure.
+    process.env['TRUEUP_ENV_LOADED'] = loaded;
+  }
 
   const parsed = EnvSchema.safeParse(process.env);
   if (!parsed.success) {
@@ -105,6 +164,12 @@ export function requireSecret(value: string | undefined, name: string): string {
 /** Reports which pieces of Phase 1 setup are complete. Used by the startup banner. */
 export function describeReadiness(config: Config): string[] {
   const lines: string[] = [];
+  const loaded = process.env['TRUEUP_ENV_LOADED'];
+  lines.push(
+    loaded === undefined
+      ? 'warn no .env file found (looked for .env, then ../.env)'
+      : `ok   .env loaded from ${loaded}`,
+  );
   lines.push(config.rn.clientId ? 'ok   RN_CLIENT_ID' : 'MISS RN_CLIENT_ID');
   lines.push(config.rn.webhookSecret ? 'ok   RN_WEBHOOK_SECRET' : 'MISS RN_WEBHOOK_SECRET');
   lines.push(config.rn.destinationId ? 'ok   RN_DESTINATION_ID' : 'MISS RN_DESTINATION_ID');
