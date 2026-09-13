@@ -31,6 +31,9 @@ pnpm-debug.log*
 # local agent config
 .claude/
 
+# scratch: cloned upstream repos and throwaway working dirs
+.tmp/
+
 # OS
 .DS_Store
 Thumbs.db

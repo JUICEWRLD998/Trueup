@@ -1,0 +1,55 @@
+{
+  "$comment": "Seed data for the demo and for tests. Deliberately shaped so the interesting cases are reachable: INV-4471 is the unattributed payment, INV-4472 shares a payer with INV-4471 so the ambiguity guard has something to fire on, and INV-4473 is the clean control case with a correct reference.",
+  "invoices": [
+    {
+      "id": "INV-4471",
+      "customer": "Northwind Freight",
+      "amount": "4200.00",
+      "currency": "USDC",
+      "reference": "INV-4471",
+      "issuedAt": "2026-08-01T00:00:00.000Z",
+      "dueAt": "2026-08-31T00:00:00.000Z",
+      "knownPayerAddresses": ["0xA11CE0000000000000000000000000000000dEAd"]
+    },
+    {
+      "id": "INV-4472",
+      "customer": "Northwind Freight",
+      "amount": "1500.00",
+      "currency": "USDC",
+      "reference": "INV-4472",
+      "issuedAt": "2026-08-14T00:00:00.000Z",
+      "dueAt": "2026-09-13T00:00:00.000Z",
+      "knownPayerAddresses": ["0xA11CE0000000000000000000000000000000dEAd"]
+    },
+    {
+      "id": "INV-4473",
+      "customer": "Harbourline Logistics",
+      "amount": "980.50",
+      "currency": "USDC",
+      "reference": "INV-4473",
+      "issuedAt": "2026-08-20T00:00:00.000Z",
+      "dueAt": "2026-09-19T00:00:00.000Z",
+      "knownPayerAddresses": ["0xB0b0000000000000000000000000000000000F00D"]
+    }
+  ],
+  "suppliers": [
+    {
+      "id": "SUP-CARRIER",
+      "name": "Cascade Carriers",
+      "address": "0xC0FFEE0000000000000000000000000000000001",
+      "amountOwed": "1200.00"
+    },
+    {
+      "id": "SUP-FUEL",
+      "name": "Pike Fuel Services",
+      "address": "0xC0FFEE0000000000000000000000000000000002",
+      "amountOwed": "860.00"
+    },
+    {
+      "id": "SUP-WAREHOUSE",
+      "name": "Dockside Warehousing",
+      "address": "0xC0FFEE0000000000000000000000000000000003",
+      "amountOwed": "2140.00"
+    }
+  ]
+}
