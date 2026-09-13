@@ -1,0 +1,14 @@
+# Normalise line endings in the repository so a Windows checkout and a Linux CI
+# run produce identical bytes. Without this, git rewrites LF to CRLF on checkout,
+# which makes diffs noisy and can break tools that hash file contents.
+* text=auto eol=lf
+
+# Binary-ish artefacts we should never touch
+*.png binary
+*.jpg binary
+*.woff binary
+*.woff2 binary
+
+# Keep lockfiles byte-exact — pnpm verifies integrity hashes
+pnpm-lock.yaml -text
+*.json text

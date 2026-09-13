@@ -149,17 +149,36 @@ transaction on the chain named next to it.
 
 ## Status
 
-Phase 1 — foundations. See [`implementation.md`](./implementation.md) for the full plan,
-and [`docs/limits.md`](./docs/limits.md) for an honest account of what is not built yet.
+**Phase 1 — foundations, complete.** The bridge is built and covered by 71 tests.
+Nothing has moved real value yet: the API clients are written against published
+contracts but have not been run against the live services. See
+[`implementation.md`](./implementation.md) for the plan and
+[`docs/limits.md`](./docs/limits.md) for an itemised account of what is not built.
 
 | Component | State |
 | --------- | ----- |
-| Request Network integration | not started |
-| `trueup-bridge` (webhook verify + classify) | not started |
-| KeeperHub `request-network` plugin | scoped, not started |
-| KeeperHub workflows W1–W4 | not started |
-| Agent workflow authoring (MCP) | not started |
-| Receipt bundle | not started |
+| Webhook signature verification (HMAC over raw bytes) | **built** — 14 tests |
+| Reconciliation engine (weighted, explainable, refuses to guess) | **built** — 19 tests |
+| ERC-7828 destination parsing | **built** — 12 tests |
+| Ledger + delivery idempotency | **built** — 12 tests |
+| KeeperHub client (dry run enforced before every broadcast) | **built** — 14 tests |
+| Request Network API client | **built**, not yet exercised live |
+| HTTP bridge (`/webhooks/request-network`, `/readyz`) | **built**, smoke-tested |
+| KeeperHub workflows W1–W4 | not built |
+| `request-network` plugin (bounty PR) | not built |
+| Agent workflow authoring over MCP | not built |
+| Receipt bundle | not built |
+| **First live transaction through KeeperHub** | **not yet** |
+
+### Notable engineering decision from Phase 1
+
+`KeeperHubClient.transferSafely` is the only exported way to move funds. It runs the
+dry run first and refuses to broadcast in three cases: the dry run reported
+`wouldRevert: true`; it failed validation (for example `insufficient_balance`); or it
+returned **no `wouldRevert` field at all**, which means it never actually exercised
+the write. That third case is the quiet one — a simulation of a read-only action
+returns `success: true` while having proved nothing. Treating it as a green light is
+precisely the mistake the platform's design exists to prevent.
 
 ---
 
@@ -170,11 +189,19 @@ and [`docs/limits.md`](./docs/limits.md) for an honest account of what is not bu
 node --version   # v24.x
 pnpm --version   # 10.x
 
+cd bridge
 pnpm install
-cp .env.example .env   # then fill it in — never commit .env
+cp ../.env.example .env   # then fill it in — never commit .env
+
+pnpm test         # 71 tests
+pnpm type-check
+pnpm dev          # starts the bridge; GET /readyz lists which keys are missing
 ```
 
-Nothing runs end to end yet; this section is updated as each phase lands.
+Seed the demo data with `pnpm exec tsx scripts/seed-demo.ts`.
+
+Nothing runs end to end yet — the live path needs Request Network and KeeperHub
+credentials. `GET /readyz` names exactly which are absent.
 
 ---
 
