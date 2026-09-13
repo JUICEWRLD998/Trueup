@@ -91,6 +91,21 @@ export interface CreateSecurePaymentInput {
   readonly redirectUrl?: string | undefined;
 }
 
+export interface RegisterWebhookOptions {
+  /**
+   * Raw `Cookie` header value from an authenticated Request Network dashboard
+   * session.
+   *
+   * Every `auth.request.network` route — including `POST /v1/webhook` — is
+   * authenticated by a `session_token` cookie. There is no client-id path:
+   * `request-network-auth-openapi.json` declares no security schemes and attaches
+   * a `Cookie` parameter to all 24 routes, and a live call carrying `x-client-id`
+   * returns `401 Unauthorized` (verified 2026-09-13). A server-to-server
+   * credential therefore cannot register this integration's webhook on its own.
+   */
+  readonly cookieHeader?: string | undefined;
+}
+
 export class RequestNetworkClient {
   private readonly apiBase: string;
   private readonly authBase: string;
@@ -178,20 +193,46 @@ export class RequestNetworkClient {
   }
 
   /**
-   * Registers a webhook URL. The returned secret is the ONLY time Request Network
-   * discloses it — persist it immediately or the integration cannot verify a
-   * single delivery and must be re-registered.
+   * Registers a webhook URL against our Client ID.
+   *
+   * The signing secret is disclosed in this response, and — contrary to the
+   * "shown once" note in Request Network's prose — `GET /v1/webhook` lists it
+   * again for an authenticated session, so a lost secret is recoverable rather
+   * than fatal. Persist it anyway.
+   *
+   * `clientId` must travel in the BODY here, not in a header: the spec marks it
+   * "required when using session auth", which is exactly this call.
    */
-  async registerWebhook(url: string): Promise<WebhookRegistrationResponse> {
-    const clientId = this.requireClientId('register a webhook');
+  async registerWebhook(
+    url: string,
+    options: RegisterWebhookOptions = {},
+  ): Promise<WebhookRegistrationResponse> {
+    const cookie = options.cookieHeader?.trim();
+    if (cookie === undefined || cookie === '') {
+      // Fail here with something actionable rather than sending a request that
+      // is certain to 401. A misleading 401 sends the next reader hunting for a
+      // bad client id, which is not the problem.
+      throw new Error(
+        'Cannot register a Request Network webhook without a dashboard session: ' +
+          'auth.request.network authenticates with a session_token cookie, and ' +
+          'x-client-id returns 401 there (verified 2026-09-13). Register the ' +
+          'webhook in the dashboard, or pass options.cookieHeader from a ' +
+          'logged-in session.',
+      );
+    }
+
+    const body: { url: string; clientId?: string } = { url };
+    if (this.clientId !== undefined && this.clientId.length > 0) {
+      body.clientId = this.clientId;
+    }
 
     const response = await this.fetchImpl(`${this.authBase}/v1/webhook`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-client-id': clientId,
+        cookie,
       },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(body),
     });
 
     const text = await response.text();

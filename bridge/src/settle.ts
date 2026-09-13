@@ -8,7 +8,7 @@
  */
 
 import { classify, type MatchResult, type SettlementSignals } from './classify.ts';
-import { KeeperHubError, deriveIdempotencyKey, STABLECOIN_PER_TRANSACTION_CAP_USD, type KeeperHubClient } from './keeperhub.ts';
+import { KeeperHubError, deriveIdempotencyKey, DEFAULT_NATIVE_DAILY_CAP_ETH, STABLECOIN_PER_TRANSACTION_CAP_USD, type KeeperHubClient } from './keeperhub.ts';
 import type { Ledger } from './ledger.ts';
 import type { RequestNetworkClient } from './rn/client.ts';
 import { isPartiallyPaid, type PaymentConfirmed } from './rn/types.ts';
@@ -25,6 +25,16 @@ export interface SettleDeps {
   readonly rn: RequestNetworkClient;
   readonly logger: Logger;
   readonly autoApproveThreshold: number;
+  /**
+   * Rehearse the whole path — decision, cap refusal, and KeeperHub's own dry run —
+   * without signing, broadcasting, or writing to the ledger.
+   *
+   * Both halves matter. Not touching the chain is the platform's dry run; not
+   * touching the ledger is ours, and it is the half that is easy to forget: a
+   * rehearsal that marked the invoice settled would leave the money shot with
+   * nothing left to settle.
+   */
+  readonly simulateOnly?: boolean | undefined;
 }
 
 export interface SettleOutcome {
@@ -36,6 +46,8 @@ export interface SettleOutcome {
   readonly reasons: readonly string[];
   readonly payouts: readonly PayoutIntent[];
   readonly holds: readonly PayoutIntent[];
+  /** True when this outcome came from a rehearsal rather than a real run. */
+  readonly dryRun?: boolean | undefined;
 }
 
 interface PayoutIntent {
@@ -44,17 +56,62 @@ interface PayoutIntent {
   readonly address: string;
   readonly amount: string;
   readonly chainId: string;
+  /**
+   * ERC-20 contract to pay in.
+   *
+   * Carried through explicitly because omitting it does not fail — it silently
+   * becomes a NATIVE transfer of the same nominal amount, which is a different asset
+   * under a different (far smaller) daily cap. A supplier expecting 6 USDC would
+   * instead be sent 6 ETH and the payout would be refused for exceeding the native
+   * cap, or worse, succeed if it did not.
+   */
+  readonly tokenAddress: string | undefined;
   readonly idempotencyKey: string;
   // Declared as `| undefined` because `exactOptionalPropertyTypes` is on and
   // these are built from possibly-absent values.
   readonly executionId?: string | undefined;
   readonly transactionHash?: string | undefined;
+  /** Present on a rehearsal only: what the dry run predicted the transfer would cost. */
+  readonly gasEstimate?: string | undefined;
   readonly error?: string | undefined;
 }
 
 /** Parses the amount string from a webhook into the paid total. */
 function paidAmountOf(event: PaymentConfirmed): string | undefined {
   return event.totalAmountPaid ?? event.amount;
+}
+
+/**
+ * Why a payout must not be attempted, or `undefined` when it is safe to try.
+ *
+ * Two refusals, both cheaper than the failure they prevent:
+ *
+ *   1. No token address. Omitting `tokenAddress` does not error — KeeperHub treats it
+ *      as a native transfer of the same nominal amount, which is a different asset
+ *      under a 0.02 ETH/day cap. Silently paying suppliers in ETH instead of USDC is
+ *      worse than refusing.
+ *   2. Above the per-transaction stablecoin cap. KeeperHub will not sign it, so
+ *      attempting it burns a round trip and produces a failed execution.
+ *
+ * Shared by the real path and the rehearsal so a dry run cannot pass something the
+ * real run would refuse — which would make the rehearsal worse than useless.
+ */
+function payoutRefusal(intent: { amount: string; tokenAddress: string | undefined }): string | undefined {
+  if (intent.tokenAddress === undefined || intent.tokenAddress.trim() === '') {
+    return (
+      `payout of ${intent.amount} carries no token address, so it would be a NATIVE ` +
+      `transfer — a different asset under a ${DEFAULT_NATIVE_DAILY_CAP_ETH} ETH/day cap. ` +
+      `Give the supplier a token address instead of letting a token payout become a native one.`
+    );
+  }
+  if (Number(intent.amount) <= STABLECOIN_PER_TRANSACTION_CAP_USD) {
+    return undefined;
+  }
+  return (
+    `payout of ${intent.amount} exceeds KeeperHub's ` +
+    `${STABLECOIN_PER_TRANSACTION_CAP_USD} USD per-transaction stablecoin cap; ` +
+    `split the payment or raise the cap for this org before retrying`
+  );
 }
 
 export async function settle(
@@ -94,9 +151,17 @@ export async function settle(
     });
   }
 
-  const payerAddresses = [event.payerAddress, event.payerEoaAddress].filter(
-    (value): value is string => value !== undefined && value !== '',
-  );
+  // Deduplicated, because Request Network sends both `payerAddress` and
+  // `payerEoaAddress` and for an externally-owned payer they are the same value.
+  // Passing both through makes every reason line on camera read
+  // "payer 0xabc…, 0xabc… is a known address for Northwind Freight".
+  const payerAddresses = [
+    ...new Set(
+      [event.payerAddress, event.payerEoaAddress].filter(
+        (value): value is string => value !== undefined && value !== '',
+      ),
+    ),
+  ];
 
   const signals: SettlementSignals = {
     reference,
@@ -154,10 +219,8 @@ export async function settle(
     );
   }
 
-  const paid = paidAmountOf(event) ?? '0';
-  ledger.applySettlement(invoice.id, paid, event.txHash, new Date().toISOString());
-
-  // Build the payout intents for this invoice's suppliers.
+  // Build the payout intents for this invoice's suppliers. Deliberately before the
+  // ledger is touched below: a rehearsal builds the same intents and then stops.
   const suppliers = ledger.suppliersForInvoice();
   const intents: PayoutIntent[] = suppliers.map((supplier) => ({
     supplierId: supplier.id,
@@ -165,6 +228,7 @@ export async function settle(
     address: supplier.address,
     amount: supplier.amountOwed,
     chainId: supplier.chainId,
+    tokenAddress: supplier.tokenAddress,
     idempotencyKey: deriveIdempotencyKey({
       workId: `${invoice.id}:${supplier.id}:${deliveryId}`,
       chainId: supplier.chainId,
@@ -172,6 +236,66 @@ export async function settle(
       amount: supplier.amountOwed,
     }),
   }));
+
+  // A rehearsal stops here. It mirrors both branches below — a hold is reported as a
+  // hold, a payable settlement has each payout simulated — and it writes nothing: not
+  // a transaction, and not the ledger. A rehearsal that marked the invoice settled
+  // would leave the real run with no open invoice to match against.
+  if (deps.simulateOnly === true) {
+    if (result.verdict === 'held') {
+      logger.warn('dry run: settlement would be held for human release', {
+        deliveryId,
+        invoiceId: invoice.id,
+        confidence: result.confidence,
+      });
+      return { ...base, verdict: 'held', payouts: [], holds: intents, dryRun: true };
+    }
+
+    const simulated: PayoutIntent[] = [];
+    for (const intent of intents) {
+      const refusal = payoutRefusal(intent);
+      if (refusal !== undefined) {
+        logger.warn('dry run: payout would be refused', {
+          deliveryId,
+          supplierId: intent.supplierId,
+          amount: intent.amount,
+          reason: refusal,
+        });
+        simulated.push({ ...intent, error: refusal });
+        continue;
+      }
+      try {
+        const simulation = await deps.kh.simulateTransfer({
+          chainId: intent.chainId,
+          recipientAddress: intent.address,
+          amount: intent.amount,
+          tokenAddress: intent.tokenAddress,
+        });
+        simulated.push({ ...intent, gasEstimate: simulation.gasEstimate });
+      } catch (error) {
+        simulated.push({
+          ...intent,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    logger.info('dry run complete — nothing signed, nothing broadcast, ledger untouched', {
+      deliveryId,
+      invoiceId: invoice.id,
+      payouts: simulated.length,
+      failures: simulated.filter((intent) => intent.error !== undefined).length,
+    });
+
+    return { ...base, payouts: simulated, holds: [], dryRun: true };
+  }
+
+  // Past this point we are acting, so record that the inbound payment actually
+  // landed. This sits BELOW the rehearsal return on purpose: marking an invoice
+  // settled is a real state change, and a dry run that performed it would leave the
+  // real run with no open invoice to match against.
+  const paid = paidAmountOf(event) ?? '0';
+  ledger.applySettlement(invoice.id, paid, event.txHash, new Date().toISOString());
 
   // A held settlement stages the payout for a human to release; it does not move
   // money. This is the brake, and it is the reason a low-confidence match is
@@ -202,21 +326,18 @@ export async function settle(
   const executionIds: string[] = [];
 
   for (const intent of intents) {
-    const capped = Number(intent.amount) > STABLECOIN_PER_TRANSACTION_CAP_USD;
-    if (capped) {
-      // KeeperHub refuses to sign a stablecoin transfer above 100 USD on any
-      // write path. Attempting it wastes a round trip and produces a failed
-      // execution, so we stop here and say why.
-      const message =
-        `payout of ${intent.amount} exceeds KeeperHub's ` +
-        `${STABLECOIN_PER_TRANSACTION_CAP_USD} USD per-transaction stablecoin cap; ` +
-        `split the payment or raise the cap for this org before retrying`;
-      logger.error('payout blocked by documented stablecoin cap', {
+    const refusal = payoutRefusal(intent);
+    if (refusal !== undefined) {
+      // Either the amount is above the cap KeeperHub will sign, or there is no token
+      // address and this would silently become a native transfer. Both are caught here
+      // rather than discovered as a failed execution or a wrong asset.
+      logger.error('payout refused before submission', {
         deliveryId,
         supplierId: intent.supplierId,
         amount: intent.amount,
+        reason: refusal,
       });
-      executed.push({ ...intent, error: message });
+      executed.push({ ...intent, error: refusal });
       continue;
     }
 
@@ -226,6 +347,7 @@ export async function settle(
           chainId: intent.chainId,
           recipientAddress: intent.address,
           amount: intent.amount,
+          tokenAddress: intent.tokenAddress,
         },
         intent.idempotencyKey,
       );

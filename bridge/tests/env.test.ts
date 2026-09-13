@@ -13,6 +13,44 @@
 import { describe, expect, it } from 'vitest';
 import { EnvSchema } from '../src/env.ts';
 
+describe('BRIDGE_DRY_RUN', () => {
+  const parse = (value: string) => {
+    const result = EnvSchema.safeParse({ BRIDGE_DRY_RUN: value });
+    expect(result.success).toBe(true);
+    return result.success ? result.data.BRIDGE_DRY_RUN : undefined;
+  };
+
+  it('defaults to off', () => {
+    const result = EnvSchema.safeParse({});
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.BRIDGE_DRY_RUN).toBe(false);
+    }
+  });
+
+  it('treats an empty template value as off, not on', () => {
+    expect(parse('')).toBe(false);
+  });
+
+  it('reads the string "false" as false, which the obvious shorthand does not', () => {
+    // `z.coerce.boolean()` runs Boolean('false'), which is true. An operator asking
+    // for a real run would silently get a rehearsal — and a rehearsal reports a
+    // verdict and simulated payouts, so on camera it looks almost identical.
+    expect(parse('false')).toBe(false);
+    expect(parse('FALSE')).toBe(false);
+    expect(parse('no')).toBe(false);
+    expect(parse('0')).toBe(false);
+  });
+
+  it('accepts an explicit affirmative', () => {
+    expect(parse('true')).toBe(true);
+    expect(parse('TRUE')).toBe(true);
+    expect(parse('yes')).toBe(true);
+    expect(parse('on')).toBe(true);
+    expect(parse('1')).toBe(true);
+  });
+});
+
 describe('EnvSchema blank-value handling', () => {
   it('treats an empty template value as unset, not invalid', () => {
     const result = EnvSchema.safeParse({

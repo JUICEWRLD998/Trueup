@@ -42,8 +42,22 @@ pnpm exec tsx scripts/seed-demo.ts
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/webhooks/request-network` | Receives Request Network settlement webhooks |
+| `POST` | `/webhooks/keeperhub-fallback` | Placeholder for the deferred W1 workflow: logs a KeeperHub-side "we could not attribute this" report and returns `202`. **Moves nothing**, and makes no decision yet — it exists so the endpoint shape is settled before W1 is authored |
 | `GET` | `/healthz` | Liveness |
-| `GET` | `/readyz` | Which configuration is present and which is missing |
+| `GET` | `/readyz` | Which configuration is present and which is missing, including whether `BRIDGE_DRY_RUN` is on |
+
+### Dry run
+
+`BRIDGE_DRY_RUN` rehearses the whole path without moving anything: the settlement is
+classified, each payout is simulated through KeeperHub (gas estimated, reverts caught),
+and **nothing is signed, broadcast, or written to the ledger**. Only `1`, `true`, `yes`
+or `on` turn it on — the string `false` means false, which the obvious
+`z.coerce.boolean()` shorthand gets wrong. The startup banner states the mode either
+way, and the webhook response carries `"dryRun": true`.
+
+That last part is not incidental. A dry run that marked the invoice settled would leave
+the real run with no open invoice to match against, so the ledger write sits below the
+rehearsal return and `tests/settle.test.ts` pins it.
 
 ### Response codes on the webhook
 
@@ -69,6 +83,7 @@ src/
   classify.ts     reconciliation scoring — pure, testable, no I/O
   settle.ts       orchestration: webhook → decision → payout or hold
   keeperhub.ts    KeeperHub client; simulate-then-execute enforced in transferSafely
+  receipt.ts      the auditable record — allowlisted, bounded, versioned
   server.ts       HTTP entry: raw body → verify → idempotency → settle
   rn/
     types.ts      webhook payload schemas
@@ -78,7 +93,30 @@ src/
 tests/
   verify.test.ts  forgery, tampering, re-serialisation, encoding
   classify.test.ts exact, partial, ambiguous, no-evidence
+  fixtures.test.ts the demo's preconditions — caps, sums, expected verdicts
+  settle.test.ts  the rehearsal writes nothing; a payout without a token is refused
+  receipt.test.ts bounded, ordered, credential-refusing
+  client.test.ts  cookie-only webhook auth; destinationId omission
+scripts/
+  seed-demo.ts        seeds the ledger; --reset returns it to a clean slate
+  demo-rehearsal.ts   the whole loop, simulated: nothing signed, ledger untouched
+  create-payment.ts   creates an RN payment request (defaults to a wrong reference)
+  debug-simulate.ts   raw dry-run output, for diagnosing a refusal
 ```
+
+## Scripts worth knowing
+
+```bash
+pnpm exec tsx scripts/seed-demo.ts --reset   # clean slate for a rehearsal or a take
+pnpm exec tsx scripts/demo-rehearsal.ts      # the loop, simulated
+pnpm exec tsx scripts/balance.ts             # does the org wallet have enough USDC?
+pnpm exec tsx scripts/create-payment.ts 18.00 PO-9001
+```
+
+`create-payment.ts` defaults its reference to a deliberately **wrong** one. `settle()`
+reads the reference back from Request Network and treats an exact match as decisive, so
+a request carrying `INV-4471` would classify as `attributed` and never reach the scoring
+path the demo is about.
 
 ## Two implementation notes worth reading before editing
 
