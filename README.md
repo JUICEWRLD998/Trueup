@@ -66,10 +66,10 @@ Nothing is inferred at execution time. That is the whole point.
         │  KEEPERHUB — the execution layer                          │
         │                                                           │
         │  W1  inbound-reconcile                                    │
-        │      Transfer trigger (watched addr + memo filter)         │
-        │        → Condition (reference present?)                    │
-        │        → true : record + notify                            │
-        │        → false: match → payout                             │
+        │      Event trigger on the token contract (Sepolia)         │
+        │        → Condition (is it our address?)                    │
+        │        → true : bridge decides                             │
+        │        → false: not ours                                   │
         │                                                           │
         │  W2  supplier-payout                                      │
         │      simulate:true → wouldRevert:false → execute_transfer  │
@@ -158,11 +158,32 @@ Reproduce it with `pnpm exec tsx scripts/first-transaction.ts` from `bridge/`.
 
 ## Status
 
-**Phase 1 — foundations, complete.** The bridge is built and covered by 71 tests.
-Nothing has moved real value yet: the API clients are written against published
-contracts but have not been run against the live services. See
-[`implementation.md`](./implementation.md) for the plan and
-[`docs/limits.md`](./docs/limits.md) for an itemised account of what is not built.
+**Phase 2 — closing the loop.** The bridge is built and covered by **143 tests**
+across 10 files, and `pnpm type-check` is clean. Phase 1 executed a real transfer
+through KeeperHub; Phase 2 added the receipt bundle, a whole-loop dry run, and the
+payout path's missing token handling.
+
+The full loop can be rehearsed today without moving anything:
+
+```bash
+cd bridge
+pnpm exec tsx scripts/seed-demo.ts --reset
+pnpm exec tsx scripts/demo-rehearsal.ts
+```
+
+That classifies a settlement, matches it to an invoice, and simulates all three
+supplier payouts through KeeperHub's dry-run endpoint — real gas estimates, real
+revert detection, no signature, no broadcast, and the ledger left exactly as it was.
+
+What is **not** done: the Request Network webhook is not registered, so the bridge has
+never received a signed delivery from the live service. The existing payment
+destination resolves to mainnet, and its payee is not the KeeperHub organisation
+wallet, so KeeperHub's Transfer trigger would not see the inbound settlement. Both are
+recorded in [`docs/limits.md`](./docs/limits.md) along with everything else that is
+mocked, hardcoded, or unfinished.
+
+See [`implementation.md`](./implementation.md) for the plan and
+[`docs/limits.md`](./docs/limits.md) for the itemised account of what is not built.
 
 | Component | State |
 | --------- | ----- |
@@ -170,14 +191,16 @@ contracts but have not been run against the live services. See
 | Reconciliation engine (weighted, explainable, refuses to guess) | **built** — 19 tests |
 | ERC-7828 destination parsing | **built** — 12 tests |
 | Ledger + delivery idempotency | **built** — 12 tests |
-| KeeperHub client (dry run enforced before every broadcast) | **built** — 14 tests |
-| Request Network API client | **built**, not yet exercised live |
+| KeeperHub client (dry run enforced before every broadcast) | **built** — 17 tests |
+| Request Network API client | **built** — payment creation and read-back verified live |
 | HTTP bridge (`/webhooks/request-network`, `/readyz`) | **built**, smoke-tested |
+| Receipt bundle | **built** — 23 tests; not yet wired to a run |
+| Whole-loop dry run (`BRIDGE_DRY_RUN`) | **built** — run live against KeeperHub |
 | KeeperHub workflows W1–W4 | not built |
 | `request-network` plugin (bounty PR) | not built |
 | Agent workflow authoring over MCP | not built |
-| Receipt bundle | not built |
-| **First live transaction through KeeperHub** | **not yet** |
+| Request Network webhook registered | **not done** — dashboard step |
+| **First live transaction through KeeperHub** | **done** — hash below |
 
 ### Notable engineering decision from Phase 1
 
@@ -202,7 +225,7 @@ cd bridge
 pnpm install
 cp ../.env.example .env   # then fill it in — never commit .env
 
-pnpm test         # 71 tests
+pnpm test         # 143 tests
 pnpm type-check
 pnpm dev          # starts the bridge; GET /readyz lists which keys are missing
 ```

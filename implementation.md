@@ -87,9 +87,11 @@ Everything in this section was checked against live sources during planning on 2
 
 ### 3.2 KeeperHub — workflow model
 
-- **Triggers:** Manual, Schedule (interval/cron/timezone), Webhook (generated URL, optional auth headers), Event (contract address + signature), Block (network + interval; `1` = every block), **Transfer** (payment arriving at a watched address, with optional memo filter — exact `0x` + 64-hex match, or a plaintext prefix).
+- **Triggers:** Manual, Schedule (interval/cron/timezone), Webhook (generated URL, optional auth headers), **Event** (contract address + ABI + event name), Block (network + interval; `1` = every block), **Transfer** (payment arriving at a watched address, with optional memo filter — exact `0x` + 64-hex match, or a plaintext prefix).
 
-  > The **Transfer trigger with memo filter** is the single most important node for this project. It is what lets KeeperHub attribute an inbound payment without a human.
+  > ⚠️ **Corrected in Phase 2 — this assumption was wrong, and W1 rested on it.** The **Transfer** trigger is **Tempo-only**. Its own schema reads *"Fires when a TIP-20 TransferWithMemo payment lands on a watched Tempo address"* and requires `network: 'Tempo chain ID ("4217" mainnet, "42431" Moderato)'` (`.tmp/kh/lib/mcp/workflow-schema-constants.ts`, entry `TRIGGERS.Transfer`); the editor pins it with `allowedChainIds: ["4217", "42431"]` (`.tmp/kh/components/workflow/config/trigger-config.tsx:398`), and the enum labels it `TEMPO_PAYMENT = "Transfer" // keeperhub custom field` (`.tmp/kh/lib/workflow/store.ts:20`). It is **not** a generic EVM ERC-20 watcher, so it cannot watch the Sepolia org wallet.
+  >
+  > Consequence: the memo-filtered Transfer trigger — described here as "the single most important node for this project" — is unavailable for any Request Network flow, because RN settles on Ethereum, Arbitrum, Optimism, Base, Polygon, BNB, Tron and Sepolia, and **Tempo is not an RN payment network**. The only KeeperHub-native inbound trigger on Sepolia is the **Event** trigger (`network`, `contractAddress`, `contractABI`, `eventName`), which fires on **every** transfer of the watched token contract and has no memo or argument filter, so a recipient check has to happen downstream in a Condition. ERC-20 transfers carry no memo at all, which means every inbound payment on Sepolia is genuinely unattributed — the exact problem this project exists to solve, and the reason the attribution decision belongs in the bridge. See `docs/limits.md`.
 - **Web3 actions:** reads `web3/check-balance`, `web3/check-token-balance`, `web3/get-spl-token-balance`, `web3/read-contract` (no wallet). Writes `web3/transfer-funds`, `web3/transfer-token`, `web3/write-contract` (wallet required).
 - **`network` takes chain IDs as strings** — `"1"`, `"11155111"`, `"8453"`, `"42161"`, `"137"`. `tokenConfig` is a token-select value, not a bare address. There is no per-action `walletId`. For contract actions, `abiFunction` is the plain name for unique functions, full signature for overloaded ones.
 - **System actions:** HTTP request, conditional branching, For Each, Collect, template rendering. **Math:** sum/count/average/median/min/max/product.
@@ -170,9 +172,9 @@ Relevant because it is where matching logic *could* live, and because its limits
 - **Feature matrix:** single incoming ✓, single outgoing payout ✓, **batch incoming/outgoing — EVM only, Tron rejected with HTTP 400** ✓/✗, conversion payments (fiat-denominated) ✓, cross-chain swap-to-pay (via **Li.Fi**) ✓, recurring payments ✓.
 - **Payment types:** Native & ERC20, Conversion (fiat-denominated, paid in crypto), Crosschain, Batch, Recurring, Partial.
 - **Credentials — only two, plus one non-secret identifier:**
-  - `RN_CLIENT_ID` → sent as `x-client-id` header. Created in the dashboard **after a payment destination exists**, or programmatically via `POST https://auth.request.network/v1/client-ids`.
-  - `RN_WEBHOOK_SECRET` → returned **once** in the response body of `POST https://auth.request.network/v1/webhook`. Used server-side to compute **HMAC-SHA256 over the raw webhook body** and compare to the `x-request-network-signature` header. **Never client-side.**
-  - **Destination ID** — not a credential, not a secret; copied from the dashboard or created via `POST /v1/payee-destination`. Required in the request body unless the Client ID is bound to a payee destination. *When in doubt, send it.*
+  - `RN_CLIENT_ID` → sent as `x-client-id` header. Created in the dashboard **after a payment destination exists**. ⚠️ **Corrected in Phase 2:** it cannot be created programmatically with a client id. Every `auth.request.network` route (including `POST /v1/client-ids` and `POST /v1/webhook`) is authenticated by a **`session_token` cookie** — the stored spec declares no security schemes and attaches a `Cookie` parameter to all 24 routes, and a live call with `x-client-id` returns 401. Use the dashboard.
+  - `RN_WEBHOOK_SECRET` → returned in the response body of `POST https://auth.request.network/v1/webhook`. Used server-side to compute **HMAC-SHA256 over the raw webhook body** and compare to the `x-request-network-signature` header. **Never client-side.** ⚠️ **Corrected in Phase 2:** the docs' "shown once" wording describes the create response, not the resource — `GET /v1/webhook` re-lists every webhook **with its secret** for an authenticated session, so a lost secret is recoverable.
+  - **Destination ID** — not a credential, not a secret; copied from the dashboard or created via `POST /v1/payee-destination`. Required in the request body unless the Client ID is bound to a payee destination. *When in doubt, send it.* ⚠️ **Verified in Phase 2:** when the Client ID is bound, omitting `destinationId` entirely works — `POST /v2/secure-payments` returned 201 and the request read back with our `reference`. Our existing destination resolves to **mainnet USDC**, and its payee is **not** the KeeperHub org wallet; see `docs/limits.md`.
 - **Create a payment (happy path):**
 
   ```http
@@ -335,10 +337,10 @@ Request Network's own testnet examples use **FAU** and **`ETH-sepolia-sepolia`**
         │  KEEPERHUB  — the execution layer                         │
         │                                                           │
         │  W1  inbound-reconcile                                    │
-        │      Transfer trigger (watched addr + memo filter)        │
-        │        → Condition (reference present?)                   │
-        │        → true : record + notify                           │
-        │        → false: Code node match → payout                  │
+        │      Event trigger on the token contract (Sepolia)        │
+        │        → Condition (is it our address?)                   │
+        │        → true : bridge decides                            │
+        │        → false: not ours                                  │
         │                                                           │
         │  W2  supplier-payout                                      │
         │      simulate:true → wouldRevert:false → execute_transfer │
@@ -369,6 +371,14 @@ Request Network's own testnet examples use **FAU** and **`ETH-sepolia-sepolia`**
                         │  + reconciliation verdict            │
                         └──────────────────────────────────────┘
 ```
+
+> **Decision (2026-09-13).** W1 as drawn above cannot be built: its trigger is
+> Tempo-only (see §3.2). The chosen architecture keeps **Request Network's signed
+> webhook as the inbound anchor** and KeeperHub on the **outbound leg** — supplier
+> payouts, runs, ids, receipts and the audit trail. Record the D2 loop first, revisit
+> W1 once the loop is known to work. Stated plainly for the judges: inbound
+> *detection* is RN's webhook, not a KeeperHub trigger; the execution and the
+> observability are KeeperHub's.
 
 ### 5.2 Why the bridge service exists (and why that is a strength, not a compromise)
 
@@ -468,6 +478,8 @@ keeperhub/                       # fork — bounty submission
 ### Day 2 — Sep 14 — Close the loop
 
 **Objective:** RN webhook → KeeperHub execution, end to end, once.
+
+> **Status 2026-09-13 (phase-2/integration).** Done: signature verification, idempotency, the typed KeeperHub client with the dry run enforced, the receipt bundle, and a whole-loop dry run that runs live against KeeperHub's simulation endpoint (`scripts/demo-rehearsal.ts` — matched INV-4471 at 0.95, three payouts simulated clean, nothing signed, ledger unchanged). Not done: **W1 `inbound-reconcile`**, and the one thing on the critical path that is not ours to do — **the RN webhook is not registered**, because `auth.request.network` is cookie-only and registration needs a dashboard session. The existing payee destination also resolves to mainnet and points somewhere other than the KeeperHub org wallet, so W1's Transfer trigger would not fire. See `docs/limits.md`, and §3.2 for why W1's trigger has to be an Event trigger rather than a Transfer trigger.
 
 - [ ] **Morning — `bridge/` skeleton.** HTTP server, raw-body capture, HMAC-SHA256 verify against `x-request-network-signature`, 401 on mismatch. **Test with a forged signature before testing the happy path.**
 - [ ] **Morning — idempotency.** Persist every event by RN `requestId` + body hash. A replayed webhook returns 200 and does nothing. This is rubric points and a demo beat.
