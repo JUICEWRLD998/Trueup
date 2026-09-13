@@ -42,6 +42,61 @@ const TRANSFER = {
   amount: '1200.00',
 };
 
+describe('apiBase normalisation', () => {
+  it('does not double the /api prefix when the base already ends in /api', async () => {
+    // KH_API_BASE ships as https://app.keeperhub.com/api, and every client path
+    // also starts with /api/. Without normalisation this becomes
+    // /api/api/execute/transfer and 404s — which is exactly what happened live.
+    const seen: string[] = [];
+    const client = new KeeperHubClient({
+      apiBase: 'https://app.keeperhub.com/api',
+      apiKey: 'kh_test',
+      fetchImpl: ((input: string | URL | Request) => {
+        seen.push(typeof input === 'string' ? input : input.toString());
+        return Promise.resolve(
+          jsonResponse({ success: true, wouldRevert: false, gasEstimate: '21000' }),
+        );
+      }) as unknown as typeof fetch,
+      sleepImpl: () => Promise.resolve(),
+    });
+
+    await client.simulateTransfer(TRANSFER);
+    expect(seen[0]).toBe('https://app.keeperhub.com/api/execute/transfer');
+  });
+
+  it('accepts a bare origin too', async () => {
+    const seen: string[] = [];
+    const client = new KeeperHubClient({
+      apiBase: 'https://app.keeperhub.com',
+      apiKey: 'kh_test',
+      fetchImpl: ((input: string | URL | Request) => {
+        seen.push(typeof input === 'string' ? input : input.toString());
+        return Promise.resolve(jsonResponse({ success: true, wouldRevert: false }));
+      }) as unknown as typeof fetch,
+      sleepImpl: () => Promise.resolve(),
+    });
+
+    await client.simulateTransfer(TRANSFER);
+    expect(seen[0]).toBe('https://app.keeperhub.com/api/execute/transfer');
+  });
+
+  it('tolerates a trailing slash', async () => {
+    const seen: string[] = [];
+    const client = new KeeperHubClient({
+      apiBase: 'https://app.keeperhub.com/api/',
+      apiKey: 'kh_test',
+      fetchImpl: ((input: string | URL | Request) => {
+        seen.push(typeof input === 'string' ? input : input.toString());
+        return Promise.resolve(jsonResponse({ success: true, wouldRevert: false }));
+      }) as unknown as typeof fetch,
+      sleepImpl: () => Promise.resolve(),
+    });
+
+    await client.simulateTransfer(TRANSFER);
+    expect(seen[0]).toBe('https://app.keeperhub.com/api/execute/transfer');
+  });
+});
+
 describe('transferSafely', () => {
   it('dry-runs, then broadcasts with an idempotency key', async () => {
     const { client, spy } = makeClient((_url, init) => {

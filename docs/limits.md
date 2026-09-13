@@ -22,19 +22,19 @@ and tested**:
 | Reconciliation scoring | built | 19 tests, including the ambiguity refusal |
 | ERC-7828 destination parsing | built | last-colon split so CAIP-2 colons survive |
 | Ledger + idempotency store | built | atomic JSON writes |
-| Request Network API client | built | not yet exercised against the live API |
-| KeeperHub API client | built | not yet exercised against the live API |
-| HTTP bridge | built | not yet exercised end to end |
+| KeeperHub API client | **built and exercised live** | 17 tests; a real transfer executed on Sepolia |
+| Request Network API client | built, Client ID verified live | `GET /v2/currencies` authenticates with our Client ID |
+| HTTP bridge | built, smoke-tested | forged signature rejected 401; unverified delivery held, not paid |
+| **Live transaction through KeeperHub** | **done** | hash in the README, receipt `success`, verified on-chain |
 | KeeperHub workflows W1–W4 | **not built** | — |
 | `request-network` plugin | **not built** | — |
 | Agent layer over MCP | **not built** | — |
 | Receipt bundle | **not built** | — |
-| Live transaction through KeeperHub | **not yet** | the README carries this link once it exists |
 
-**Nothing has moved real value yet.** The clients are written against published
-API contracts and covered by unit tests with injected fakes; they have not been
-run against the live services. No transaction executed through KeeperHub exists at
-the time of writing, and the README says so rather than implying otherwise.
+Testnet value has moved through KeeperHub: 1.00 USDC on Sepolia, dry-run first,
+receipt verified. **No mainnet value has moved, and the Request Network settlement
+leg has not yet been exercised** — the payment destination and webhook are still to
+be configured, so the bridge has not received a real settlement webhook.
 
 ---
 
@@ -70,6 +70,31 @@ KeeperHub's Code node sandbox exposes only `console`, `fetch` and
 an already-verified, already-classified event into a workflow. See
 `docs/architecture.md` for why this is a better architecture rather than a
 workaround.
+
+### Two API quirks found by running against the live service
+
+Both were found by pointing the client at the real API rather than a fake. Neither
+is in the documentation, and both would have cost hours on demo day.
+
+**1. `tokenConfig` breaks token transfer simulation.** Sending
+`tokenConfig: '{"decimals":6,"symbol":"fUSDC"}'` alongside `tokenAddress` makes the
+dry run fail with:
+
+```
+"revertReason": "Simulating a token transfer requires a resolvable `tokenAddress` or `tokenConfig`"
+```
+
+The message is self-contradictory — it rejects the request while claiming both fields
+are acceptable. With `tokenAddress` alone, the identical transfer simulates clean
+(`success: true`, `wouldRevert: false`, `gasEstimate: 62796`). **We send
+`tokenAddress` only.** Verified live on Sepolia, 2026-09-13.
+
+**2. `KH_API_BASE` double-prefixed the path.** The documented base is
+`https://app.keeperhub.com/api` and every client path also begins `/api/`, so a
+naive concatenation produced `/api/api/execute/transfer` and a 404. The client now
+normalises the base to a bare origin, so both the documented spelling and a bare
+`https://app.keeperhub.com` work, and a misconfigured base cannot silently double
+the prefix. Covered by three tests.
 
 ### Documented caps we do not try to exceed
 

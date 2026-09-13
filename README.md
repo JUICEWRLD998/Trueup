@@ -135,15 +135,24 @@ weights that produced it, so the decision is explainable after the fact.
 
 ## Proof of execution
 
-> **Transaction executed through KeeperHub:** _pending — first verified transaction is landing in
-> Phase 1. This line will carry an explorer link before anything else is built._
+**Transaction executed through KeeperHub:**
+[`0xa29ff44d1ff2fac1bae82a9177d3bad895c30b7170fcc8b41cb11ca27f4ea554`](https://sepolia.etherscan.io/tx/0xa29ff44d1ff2fac1bae82a9177d3bad895c30b7170fcc8b41cb11ca27f4ea554)
 
-This README will not claim a result it cannot show. Every hash below will be a real, resolvable
+This README does not claim a result it cannot show. Every hash below is a real, resolvable
 transaction on the chain named next to it.
 
-| What | Chain | Hash | Run id |
-| ---- | ----- | ---- | ------ |
-| _first verified transfer_ | Sepolia `11155111` | _pending_ | _pending_ |
+| What | Chain | Hash | Run id | Receipt |
+| ---- | ----- | ---- | ------ | ------- |
+| 1.00 USDC → supplier, dry-run then executed | Sepolia `11155111` | [`0xa29ff4…a554`](https://sepolia.etherscan.io/tx/0xa29ff44d1ff2fac1bae82a9177d3bad895c30b7170fcc8b41cb11ca27f4ea554) | `l6bsd6lpn9fy8d7p6899i` | `success`, block 11698386, gas 61967 |
+
+Executed in this exact order — the sequence the whole submission rests on:
+
+1. `POST /api/execute/transfer` with `"simulate": true` → `success: true`, `wouldRevert: false`,
+   `gasEstimate: 62796`. No signature, no broadcast, no hash.
+2. The identical call **without** `simulate`, with a derived idempotency key.
+3. Polled to terminal via `X-Poll-Interval-Hint`, then read the receipt.
+
+Reproduce it with `pnpm exec tsx scripts/first-transaction.ts` from `bridge/`.
 
 ---
 

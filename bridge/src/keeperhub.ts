@@ -163,7 +163,13 @@ export class KeeperHubClient {
   private readonly sleepImpl: (ms: number) => Promise<void>;
 
   constructor(options: KeeperHubClientOptions) {
-    this.apiBase = options.apiBase.replace(/\/$/, '');
+    // Every path below already starts with `/api/`, but KH_API_BASE is
+    // documented as `https://app.keeperhub.com/api` and ships that way in
+    // .env.example. Naively concatenating gives `/api/api/execute/transfer`,
+    // which 404s. Normalise to a bare origin so both spellings work and a
+    // misconfigured base can never silently double the prefix.
+    const trimmed = options.apiBase.replace(/\/+$/, '');
+    this.apiBase = trimmed.endsWith('/api') ? trimmed.slice(0, -4) : trimmed;
     this.apiKey = options.apiKey;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleepImpl = options.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
