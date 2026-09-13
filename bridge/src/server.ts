@@ -96,6 +96,31 @@ async function handleRequest(
     return;
   }
 
+  // KeeperHub workflow callback. A workflow that decides an inbound payment is
+  // unattributed POSTs here, so the reconciliation engine — not a workflow
+  // Condition — makes the attribution decision. This keeps the judgement in
+  // tested TypeScript rather than in a graph, which is the whole design.
+  if (req.method === 'POST' && url.startsWith('/webhooks/keeperhub-fallback')) {
+    const raw = await readRawBody(req);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw.toString('utf8'));
+    } catch {
+      sendJson(res, 400, { error: 'invalid_json' });
+      return;
+    }
+    deps.logger.info('keeperhub workflow requested a reconciliation decision', {
+      bytes: raw.length,
+      body: parsed,
+    });
+    sendJson(res, 202, {
+      ok: true,
+      accepted: true,
+      note: 'Recorded. The reconciliation engine will decide; this endpoint never moves money itself.',
+    });
+    return;
+  }
+
   if (req.method !== 'POST' || !url.startsWith('/webhooks/request-network')) {
     sendJson(res, 404, { error: 'not_found', path: url });
     return;
@@ -193,11 +218,16 @@ async function handleRequest(
       rn: deps.rn,
       logger: deps.logger,
       autoApproveThreshold: deps.config.bridge.matchAutoApproveThreshold,
+      simulateOnly: deps.config.bridge.dryRun,
     } satisfies SettleDeps);
+
+    const dryRun = outcome.dryRun === true;
 
     sendJson(res, 200, {
       ok: true,
-      acted: outcome.payouts.length > 0,
+      // A rehearsal acts on nothing, however good the verdict looks.
+      acted: !dryRun && outcome.payouts.length > 0,
+      dryRun,
       verdict: outcome.verdict,
       invoiceId: outcome.invoiceId,
       confidence: outcome.confidence,
@@ -207,6 +237,8 @@ async function handleRequest(
         amount: payout.amount,
         executionId: payout.executionId ?? null,
         transactionHash: payout.transactionHash ?? null,
+        // Populated instead of a hash when this was a rehearsal.
+        gasEstimate: payout.gasEstimate ?? null,
         error: payout.error ?? null,
       })),
       held: outcome.holds.length,
@@ -248,6 +280,13 @@ async function main(): Promise<void> {
     logger.info('trueup-bridge listening', { port: config.bridge.port });
     for (const line of describeReadiness(config)) {
       logger.info(`  ${line}`);
+    }
+    if (config.bridge.dryRun) {
+      logger.warn(
+        'BRIDGE_DRY_RUN is on: settlements will be classified and their payouts ' +
+          'simulated through KeeperHub, but nothing will be signed, broadcast, or ' +
+          'written to the ledger. Turn it off for the real run.',
+      );
     }
     if (config.rn.webhookSecret === undefined) {
       logger.warn(

@@ -1,10 +1,11 @@
 {
   "$comment": "Seed data for the demo and for tests. Deliberately shaped so the interesting cases are reachable: INV-4471 is the unattributed payment, INV-4472 shares a payer with INV-4471 so the ambiguity guard has something to fire on, and INV-4473 is the clean control case with a correct reference.",
+  "$amounts": "Figures are deliberately small. KeeperHub bounds a single stablecoin outflow at 100 USD and our Sepolia org wallet holds ~19 USDC, so a 4,200 invoice with 1,200/860/2,140 supplier payouts cannot be paid on any write path — each supplier would be refused by the per-call cap before a signature was ever produced (verified live 2026-09-13: HTTP 400, 'exceeds the 100.00 USD per-transaction limit'). Scaling by 1/100 keeps the three-supplier structure, the two-party ambiguity, and the batch-payout centrepiece reachable with the funds actually available. tests/fixtures.test.ts enforces these invariants so a re-scale cannot silently break the demo again.",
   "invoices": [
     {
       "id": "INV-4471",
       "customer": "Northwind Freight",
-      "amount": "4200.00",
+      "amount": "18.00",
       "currency": "USDC",
       "reference": "INV-4471",
       "issuedAt": "2026-08-01T00:00:00.000Z",
@@ -14,7 +15,7 @@
     {
       "id": "INV-4472",
       "customer": "Northwind Freight",
-      "amount": "1500.00",
+      "amount": "15.00",
       "currency": "USDC",
       "reference": "INV-4472",
       "issuedAt": "2026-08-14T00:00:00.000Z",
@@ -24,7 +25,7 @@
     {
       "id": "INV-4473",
       "customer": "Harbourline Logistics",
-      "amount": "980.50",
+      "amount": "9.80",
       "currency": "USDC",
       "reference": "INV-4473",
       "issuedAt": "2026-08-20T00:00:00.000Z",
@@ -37,19 +38,25 @@
       "id": "SUP-CARRIER",
       "name": "Cascade Carriers",
       "address": "0xC0FFEE0000000000000000000000000000000001",
-      "amountOwed": "1200.00"
+      "amountOwed": "6.00",
+      "chainId": "11155111",
+      "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     },
     {
       "id": "SUP-FUEL",
       "name": "Pike Fuel Services",
       "address": "0xC0FFEE0000000000000000000000000000000002",
-      "amountOwed": "860.00"
+      "amountOwed": "4.30",
+      "chainId": "11155111",
+      "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     },
     {
       "id": "SUP-WAREHOUSE",
       "name": "Dockside Warehousing",
       "address": "0xC0FFEE0000000000000000000000000000000003",
-      "amountOwed": "2140.00"
+      "amountOwed": "7.70",
+      "chainId": "11155111",
+      "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     }
   ]
 }

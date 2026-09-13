@@ -27,6 +27,8 @@ export interface Config {
     port: number;
     publicUrl: string | undefined;
     matchAutoApproveThreshold: number;
+    /** Rehearse the whole path without signing, broadcasting, or writing state. */
+    dryRun: boolean;
   };
 }
 
@@ -57,6 +59,27 @@ const optional = <T extends z.ZodTypeAny>(schema: T) =>
 const withDefault = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess(blankAsUnset, schema) as unknown as z.ZodType<z.output<T>>;
 
+/**
+ * A boolean flag parsed explicitly, because the obvious shorthand is wrong.
+ *
+ * `z.coerce.boolean()` runs `Boolean(value)`, so the string `"false"` — non-empty
+ * and therefore truthy — becomes `true`. An operator who writes
+ * `BRIDGE_DRY_RUN=false` would silently get a rehearsal when they asked for a real
+ * run, which is the worst way for this particular flag to fail. Only an explicit
+ * affirmative counts; anything else, including an empty value, is `false`.
+ */
+const boolFlag = (defaultValue: boolean) =>
+  z.preprocess((value) => {
+    if (typeof value !== 'string') {
+      return value;
+    }
+    const normalised = value.trim().toLowerCase();
+    if (normalised === '') {
+      return undefined;
+    }
+    return ['1', 'true', 'yes', 'on'].includes(normalised);
+  }, z.boolean().default(defaultValue));
+
 /** Exported so tests can exercise the blank-value handling without touching process.env. */
 export const EnvSchema = z.object({
   RN_CLIENT_ID: optional(z.string().min(1)),
@@ -78,6 +101,7 @@ export const EnvSchema = z.object({
 
   BRIDGE_PORT: withDefault(z.coerce.number().int().positive().max(65535).default(8787)),
   BRIDGE_PUBLIC_URL: optional(z.string().url()),
+  BRIDGE_DRY_RUN: boolFlag(false),
   MATCH_AUTO_APPROVE_THRESHOLD: withDefault(
     z.coerce.number().min(0).max(1).default(0.85),
   ),
@@ -147,6 +171,7 @@ export function loadConfig(envPath?: string): Config {
       port: env.BRIDGE_PORT,
       publicUrl: env.BRIDGE_PUBLIC_URL,
       matchAutoApproveThreshold: env.MATCH_AUTO_APPROVE_THRESHOLD,
+      dryRun: env.BRIDGE_DRY_RUN,
     },
   };
 }
@@ -175,5 +200,13 @@ export function describeReadiness(config: Config): string[] {
   lines.push(config.rn.destinationId ? 'ok   RN_DESTINATION_ID' : 'MISS RN_DESTINATION_ID');
   lines.push(config.kh.apiKey ? 'ok   KH_API_KEY' : 'MISS KH_API_KEY');
   lines.push(config.kh.orgWallet ? 'ok   KH_ORG_WALLET' : 'MISS KH_ORG_WALLET');
+  // Stated unconditionally, and first thing an operator reads, because a service
+  // running in rehearsal mode still classifies and still reports a verdict — it just
+  // never moves money. That is exactly the state worth being loud about.
+  lines.push(
+    config.bridge.dryRun
+      ? 'DRY  BRIDGE_DRY_RUN — rendering decisions only; nothing will be signed or broadcast'
+      : 'off  BRIDGE_DRY_RUN (live: payouts will be signed and broadcast)',
+  );
   return lines;
 }

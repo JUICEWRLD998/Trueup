@@ -115,6 +115,18 @@ export class Ledger {
     return this.state;
   }
 
+  /**
+   * Discards all state, in memory and on the next `save()`.
+   *
+   * Only `seed-demo.ts --reset` calls this. It exists because seeding is
+   * deliberately non-destructive — an invoice left `settled` by an earlier run
+   * stays settled — so returning the demo to a clean slate has to be something
+   * you ask for explicitly rather than a side effect of re-running the seed.
+   */
+  reset(): void {
+    this.state = emptyState();
+  }
+
   // --- invoices -----------------------------------------------------------
 
   addInvoice(invoice: Invoice): void {
