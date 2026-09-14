@@ -6,7 +6,7 @@ hiding them. The organisers' submission form asks what still breaks or is
 unfinished and notes that a candid answer has never hurt a submission — this file
 is the honest source for that answer.
 
-_Last updated: Phase 2 (2026-09-13)._
+_Last updated: Phase 2 + product hardening (2026-09-14)._
 
 ---
 
@@ -20,10 +20,12 @@ the bridge and becoming executed supplier payouts. State as of this update:
 | Webhook signature verification | built | 14 tests, including forgery, tampering, re-serialisation, and base64 encoding |
 | Reconciliation scoring | built | 19 tests, including the ambiguity refusal |
 | ERC-7828 destination parsing | built | last-colon split so CAIP-2 colons survive |
-| Ledger + idempotency store | built | atomic JSON writes |
+| Ledger + idempotency store | built | atomic JSON writes, versioned; a v1 file is migrated with a note |
+| **Invoice intake** | **built** | `POST /invoices` + `scripts/add-invoice.ts`, both calling one `registerInvoice()`; 13 tests on the rules, 9 on the HTTP surface |
+| **Payables bound to their invoice** | **built** | `payablesForInvoice(invoiceId)` always filters; a supplier on two invoices is pinned by a settle test |
 | KeeperHub API client | **built and exercised live** | 17 tests; a real transfer executed on Sepolia |
 | Request Network API client | **built, payment creation verified live** | `POST /v2/secure-payments` returned 201 and `GET /v2/request/{id}` read back `reference: INV-4471` |
-| HTTP bridge | built, smoke-tested | forged signature rejected 401; replayed delivery acknowledged, not re-executed |
+| HTTP bridge | built, smoke-tested | forged signature rejected 401; replayed delivery acknowledged, not re-executed; intake and the workflow callback behind `BRIDGE_ADMIN_TOKEN` |
 | **Live transaction through KeeperHub** | **done** | hash in the README, receipt `success`, verified on-chain |
 | Receipt bundle | **built and tested, not yet wired to a run** | 23 tests; `receipt.ts` projects allowlisted fields and refuses credential-shaped keys |
 | Whole-loop dry run | **built, run live** | `scripts/demo-rehearsal.ts` — matched INV-4471 at 0.95, 3 payouts simulated clean, ledger unchanged |
@@ -32,7 +34,7 @@ the bridge and becoming executed supplier payouts. State as of this update:
 | `request-network` plugin | **not built** | — |
 | Agent layer over MCP | **not built** | — |
 
-**Tests: 143 across 10 files.** `pnpm type-check` is clean.
+**Tests: 177 across 12 files.** `pnpm type-check` is clean.
 
 What has moved: 1.00 USDC on Sepolia through KeeperHub in Phase 1, and three
 supplier payouts simulated clean through KeeperHub in Phase 2 without broadcasting.
@@ -184,6 +186,67 @@ moving the ledger write below the rehearsal return. `scripts/demo-rehearsal.ts` 
 prints a `ledger INV-4471: 0.00/open -> 0.00/open (unchanged)` line on every run, and
 exits non-zero if that is ever false.
 
+### An invoice's payables were a flat list, so any settlement paid everyone
+
+The ledger held a `suppliers` map keyed by supplier id, with no invoice on it, and
+`suppliersForInvoice()` took **no argument** and returned every row in the book. With
+one invoice in the data — which is what the demo had — that is indistinguishable from
+correct. With three, settling `INV-4473` would have paid `INV-4471`'s three
+counterparties as well: real money to the wrong party, from a settlement that
+classified exactly as intended, with no error on any path.
+
+Found by reading our own model rather than by running it, which is why it is not in
+the "what the live services told us" list above. Fixed structurally, not locally:
+
+- `Payable` replaces `Supplier` as the stored row, and carries a required `invoiceId`.
+  The binding is on the obligation, so a counterparty may appear on any number of
+  invoices without ambiguity.
+- `Ledger.payablesForInvoice(invoiceId)` takes the invoice id as a **required**
+  argument and always filters. The invoice-blind call no longer type-checks.
+- A matched invoice with **no** payables is recorded as `held` with a reason that names
+  the fix, instead of a `matched` record with zero payouts. The old shape would have
+  reported a settlement that quietly paid nobody.
+- The ledger file is versioned. A v1 file's supplier rows name no invoice, so they are
+  dropped on load with a loud note rather than guessed at against whatever settles
+  next.
+- `fixtures/invoices.json` now puts SUP-CARRIER on both INV-4471 and INV-4472 on
+  purpose, and `tests/settle.test.ts` asserts that settling one pays only that
+  invoice's payable.
+
+### The demo fixture's payer address was not an address
+
+`fixtures/invoices.json` shipped `INV-4473`'s known payer as **41** hex digits. It
+survived two phases because every consumer only ever compared addresses as strings —
+`classify()` normalises case and checks equality, and nothing validated length. The
+first thing that would have rejected it is the intake schema, which means the demo
+fixture was **not registrable through the product's own path**.
+
+Fixed by correcting the address, and pinned twice: `fixtures.test.ts` now asserts every
+payer, payable and token address is 40 hex digits, and the same test parses the fixture
+through `IntakeRequestSchema` — the identical schema `POST /invoices` enforces — rather
+than only exercising the semantic rules. A fixture that only the seed script can load
+proves something about the seed script.
+
+### Intake is the only writer, and it is behind a token
+
+Before this, the only way an invoice and its payables reached the ledger was
+`scripts/seed-demo.ts` reading `fixtures/invoices.json`. That is a demo harness: it can
+load the three invoices written into it and nothing else, and every rule about what
+makes an invoice payable lived in a test asserting against that one file.
+
+`src/intake.ts` is now the product's input path, called by both `POST /invoices` and
+`scripts/add-invoice.ts` so neither can enforce a rule the other skips. It refuses a
+payload that could not be paid correctly — a payout above the platform cap, payables
+that do not sum to the invoice, a currency whose cap we cannot state, a payable with no
+token address (which would silently become a native transfer) — and it lists **every**
+reason, not just the first.
+
+The endpoint is guarded by `BRIDGE_ADMIN_TOKEN` and returns `503` when that is unset
+rather than running open. Intake decides who gets paid; an unauthenticated one is a way
+to have this service pay an arbitrary address. `fixtures.test.ts` also asserts the demo
+fixture passes the same validation a customer's invoice would, so the demo cannot be
+proving something about the seed script.
+
 ### The Transfer trigger is Tempo-only, and W1 was designed around it
 
 Found by reading the platform's own source rather than by running it, which is why it
@@ -304,6 +367,30 @@ tested TypeScript — rather than in a workflow Condition.
    destination whose payout wallet is the KeeperHub org wallet. Until then, a payment
    created with this Client ID is a request for **real** USDC.
 
+10. **There is no release path for a held settlement.** A hold — low confidence, or an
+    invoice with no payables configured — is recorded with its reasons and moves
+    nothing, which is the brake working. But nothing can then *release* it: workflow W4
+    (`Sign & Hold Payment`) is not built and there is no endpoint or script that
+    re-drives a held delivery. Today the operator fixes the configuration and handles
+    the payout outside this service. The settlement record means the decision is not
+    lost, but the recovery is manual.
+
+11. **One shared token, one organisation.** `BRIDGE_ADMIN_TOKEN` authenticates any
+    caller identically; there is no per-user identity, no scoping, and no record of
+    *who* registered an invoice. Every deployment of this service is single-tenant.
+    A real deployment needs per-operator credentials and an audit row naming the
+    actor, and the token must be rotated by hand.
+
+12. **Intake creates the payment request but does not deliver it.** With
+    `createPaymentRequest: true` the Request Network request exists and is linked, but
+    nothing tells the payer — no email, no link delivery, no dashboard invite. The
+    payer has to be given the payment URL out of band.
+
+13. **An invoice cannot be cancelled or credited.** Status is `open` / `settled`, and
+    intake refuses to touch a settled invoice. There is no void, no credit note, and no
+    way to correct an invoice that was registered with the wrong amount before it
+    settles — only re-registering the open version, which replaces its payables.
+
 ---
 
 ## Things we are deliberately not doing
@@ -312,7 +399,9 @@ tested TypeScript — rather than in a workflow Condition.
   would consume the remaining time without moving a single rubric criterion.
 - **No ERC-8004 identity lookup yet.** The scoring signal exists and is tested; the
   registry lookup is a Day 4 candidate and the first thing cut.
-- **No multi-invoice matching beyond one settlement to one invoice.** Three seeded
-  invoices prove the concept.
+- **One settlement still matches one invoice.** `classify()` picks a single best
+  candidate and refuses ties; it does not split a payment across invoices. The fixture
+  now carries three invoices and five payables across them, which is what proves the
+  payables are bound — not what proves split settlements.
 - **No Solana.** KeeperHub issue #2432 documents successful Solana SPL transfers
   being reconciled as terminally failed, so Solana is off the critical path.

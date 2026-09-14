@@ -13,14 +13,21 @@
  * Nothing in the build failed when that was true. It was found by hand, so it is
  * pinned here instead: re-scaling the fixtures, or changing a weight in
  * `classify.ts`, now fails a test rather than a recording.
+ *
+ * The same reasoning applies to the payable/invoice binding: the seed used to be a
+ * flat supplier list with no invoice on it, so any invoice that settled paid every
+ * counterparty in the book. That is asserted here too, and the fixture deliberately
+ * puts one supplier on two invoices so the assertion has something to catch.
  */
 
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { classify, type SettlementSignals } from '../src/classify.ts';
+import { validateIntake, IntakeRequestSchema, type IntakeRequest } from '../src/intake.ts';
 import { STABLECOIN_PER_TRANSACTION_CAP_USD } from '../src/keeperhub.ts';
-import type { Invoice } from '../src/ledger.ts';
+import { Ledger, type Invoice } from '../src/ledger.ts';
 
 interface FixtureInvoice {
   id: string;
@@ -33,16 +40,20 @@ interface FixtureInvoice {
   knownPayerAddresses: string[];
 }
 
+interface FixturePayable {
+  id: string;
+  invoiceId: string;
+  supplierId: string;
+  supplierName: string;
+  address: string;
+  amountOwed: string;
+  chainId: string;
+  tokenAddress: string;
+}
+
 interface Fixture {
   invoices: FixtureInvoice[];
-  suppliers: Array<{
-    id: string;
-    name: string;
-    address: string;
-    amountOwed: string;
-    chainId: string;
-    tokenAddress: string;
-  }>;
+  payables: FixturePayable[];
 }
 
 const fixture = JSON.parse(
@@ -70,41 +81,86 @@ function asInvoice(seed: FixtureInvoice): Invoice {
 
 const invoices = fixture.invoices.map(asInvoice);
 const invoice4471 = invoices.find((i) => i.id === 'INV-4471') as Invoice;
+const payablesOf = (invoiceId: string): FixturePayable[] =>
+  fixture.payables.filter((payable) => payable.invoiceId === invoiceId);
 
 describe('fixture shapes the demo depends on', () => {
-  it('gives every supplier a token address and a chain, so no payout can become native', () => {
-    // Omitting the token address does not fail at the API — it silently becomes a
-    // native transfer of the same nominal amount, under a 0.02 ETH/day cap. A
-    // fixture without one is a demo that pays suppliers in the wrong asset.
-    for (const supplier of fixture.suppliers) {
-      expect(supplier.tokenAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
-      expect(supplier.chainId).toMatch(/^\d+$/);
+  it('binds every payable to an invoice that exists', () => {
+    // An unbound payable — or a lookup that ignored the invoice — means settling any
+    // invoice pays whichever counterparties are in the book.
+    const ids = new Set(fixture.invoices.map((invoice) => invoice.id));
+    for (const payable of fixture.payables) {
+      expect(ids.has(payable.invoiceId)).toBe(true);
+      expect(payable.invoiceId).not.toBe('');
     }
   });
 
-  it('keeps every supplier payout under the per-call stablecoin cap', () => {
+  it('puts one supplier on two invoices, so the binding is actually exercised', () => {
+    const bySupplier = new Map<string, Set<string>>();
+    for (const payable of fixture.payables) {
+      const set = bySupplier.get(payable.supplierId) ?? new Set<string>();
+      set.add(payable.invoiceId);
+      bySupplier.set(payable.supplierId, set);
+    }
+    const shared = [...bySupplier.entries()].filter(([, set]) => set.size > 1);
+    expect(shared.length).toBeGreaterThan(0);
+  });
+
+  it('gives every payable a token address and a chain, so no payout can become native', () => {
+    // Omitting the token address does not fail at the API — it silently becomes a
+    // native transfer of the same nominal amount, under a 0.02 ETH/day cap. A
+    // fixture without one is a demo that pays suppliers in the wrong asset.
+    for (const payable of fixture.payables) {
+      expect(payable.tokenAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+      expect(payable.chainId).toMatch(/^\d+$/);
+    }
+  });
+
+  it('uses 40-hex-digit addresses everywhere', () => {
+    // The fixture's INV-4473 payer shipped as 41 hex digits for two phases and
+    // nothing noticed, because everything downstream only compared addresses as
+    // strings. An address that is not 40 hex digits is not an address, and intake
+    // would refuse it — so the demo data would not be registrable through the
+    // product's own path.
+    for (const invoice of fixture.invoices) {
+      for (const payer of invoice.knownPayerAddresses) {
+        expect(payer).toMatch(/^0x[0-9a-fA-F]{40}$/);
+      }
+    }
+    for (const payable of fixture.payables) {
+      expect(payable.address).toMatch(/^0x[0-9a-fA-F]{40}$/);
+      expect(payable.tokenAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    }
+  });
+
+  it('keeps every payout under the per-call stablecoin cap', () => {
     // The cap is a platform constant, not a preference. Above it, nothing is signed.
-    for (const supplier of fixture.suppliers) {
-      expect(Number(supplier.amountOwed)).toBeLessThanOrEqual(
+    for (const payable of fixture.payables) {
+      expect(Number(payable.amountOwed)).toBeLessThanOrEqual(
         STABLECOIN_PER_TRANSACTION_CAP_USD,
       );
     }
   });
 
-  it('keeps the payouts within the batch total cap, which bounds their sum', () => {
-    const total = fixture.suppliers.reduce((sum, s) => sum + Number(s.amountOwed), 0);
-    expect(total).toBeLessThanOrEqual(2000);
+  it('keeps each invoice\u2019s payouts within the batch total cap, which bounds their sum', () => {
+    for (const invoice of fixture.invoices) {
+      const total = payablesOf(invoice.id).reduce((sum, p) => sum + Number(p.amountOwed), 0);
+      expect(total).toBeLessThanOrEqual(2000);
+    }
   });
 
-  it('has the suppliers sum exactly to the invoice they settle', () => {
-    // If they do not, the demo either leaves an obligation unpaid or pays out more
-    // than it collected — both worse than failing here.
-    const total = fixture.suppliers.reduce((sum, s) => sum + Number(s.amountOwed), 0);
-    expect(total).toBeCloseTo(Number(invoice4471.amount), 6);
+  it('has each invoice\u2019s payables sum exactly to that invoice', () => {
+    // If they do not, the settlement either leaves an obligation unpaid or pays out
+    // more than it collected — both worse than failing here. Checked per invoice,
+    // because summing the whole book would pass while an individual invoice was wrong.
+    for (const invoice of fixture.invoices) {
+      const total = payablesOf(invoice.id).reduce((sum, p) => sum + Number(p.amountOwed), 0);
+      expect(total).toBeCloseTo(Number(invoice.amount), 6);
+    }
   });
 
-  it('keeps three suppliers, so the batch centrepiece has something to batch', () => {
-    expect(fixture.suppliers).toHaveLength(3);
+  it('keeps three payables on INV-4471, so the batch centrepiece has something to batch', () => {
+    expect(payablesOf('INV-4471')).toHaveLength(3);
   });
 
   it('shares a payer between INV-4471 and INV-4472 so the ambiguity guard is reachable', () => {
@@ -128,6 +184,50 @@ describe('fixture shapes the demo depends on', () => {
     // a deliberate mutation of one, not an accident of the fixture.
     for (const invoice of fixture.invoices) {
       expect(invoice.reference).toBe(invoice.id);
+    }
+  });
+});
+
+describe('the fixture against the real intake rules', () => {
+  it('passes validation exactly as a customer-supplied invoice would', () => {
+    // The demo data has to be registrable through the product's own path. If a
+    // fixture could only be loaded by the seed script, the demo would be proving
+    // something about the seed rather than about the product.
+    //
+    // Parsed through the same schema `POST /invoices` uses, not just the semantic
+    // rules — a malformed address would otherwise pass here and be refused by the
+    // HTTP endpoint, which is the gap this test exists to close.
+    const ledger = new Ledger(join(tmpdir(), 'unused-fixture-ledger.json'));
+
+    for (const invoice of fixture.invoices) {
+      const candidate = {
+        invoice: {
+          id: invoice.id,
+          customer: invoice.customer,
+          amount: invoice.amount,
+          currency: invoice.currency,
+          reference: invoice.reference,
+          issuedAt: invoice.issuedAt,
+          dueAt: invoice.dueAt,
+          knownPayerAddresses: invoice.knownPayerAddresses,
+        },
+        payables: payablesOf(invoice.id).map((payable) => ({
+          id: payable.id,
+          supplierId: payable.supplierId,
+          supplierName: payable.supplierName,
+          address: payable.address,
+          amountOwed: payable.amountOwed,
+          chainId: payable.chainId,
+          tokenAddress: payable.tokenAddress,
+        })),
+      };
+
+      const parsed = IntakeRequestSchema.safeParse(candidate);
+      expect(parsed.error?.issues ?? []).toEqual([]);
+      expect(parsed.success).toBe(true);
+
+      const request = candidate as IntakeRequest;
+      expect(validateIntake(request, ledger).errors).toEqual([]);
     }
   });
 });
@@ -177,7 +277,9 @@ describe("the demo's expected verdicts", () => {
     const control = invoices.find((i) => i.id === 'INV-4473') as Invoice;
     const signals: SettlementSignals = {
       reference: 'INV-4473',
-      payerAddresses: ['0xB0b0000000000000000000000000000000000F00D'],
+      // Taken from the fixture rather than hand-typed, so a typo here cannot quietly
+      // turn the control case into a test of a stranger's address.
+      payerAddresses: control.knownPayerAddresses,
       amountPaid: control.amount,
       expectedAmount: control.amount,
       paidAt: settledAt,

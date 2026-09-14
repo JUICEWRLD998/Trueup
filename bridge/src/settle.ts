@@ -114,6 +114,21 @@ function payoutRefusal(intent: { amount: string; tokenAddress: string | undefine
   );
 }
 
+/**
+ * Why a matched invoice cannot be paid, when it has no payables configured.
+ *
+ * Not the same as an unmatched settlement: the money arrived and the invoice is
+ * real, but nothing says who to pay. Recording that as a success — or as a quiet
+ * no-op — loses an obligation with no error anywhere, so it is treated as a hold.
+ */
+function noPayablesReason(invoiceId: string): string {
+  return (
+    `invoice ${invoiceId} matched, but it has no payables configured, so there is no one ` +
+    `to pay and nothing to prove. The inbound payment is recorded; register the invoice's ` +
+    `payables (POST /invoices or scripts/add-invoice.ts) before releasing anything.`
+  );
+}
+
 export async function settle(
   event: PaymentConfirmed,
   deliveryId: string,
@@ -219,36 +234,55 @@ export async function settle(
     );
   }
 
-  // Build the payout intents for this invoice's suppliers. Deliberately before the
-  // ledger is touched below: a rehearsal builds the same intents and then stops.
-  const suppliers = ledger.suppliersForInvoice();
-  const intents: PayoutIntent[] = suppliers.map((supplier) => ({
-    supplierId: supplier.id,
-    supplierName: supplier.name,
-    address: supplier.address,
-    amount: supplier.amountOwed,
-    chainId: supplier.chainId,
-    tokenAddress: supplier.tokenAddress,
+  // Build the payout intents from THIS invoice's payables — never from a global
+  // list, or settling one invoice pays another invoice's counterparties. Deliberately
+  // before the ledger is touched below: a rehearsal builds the same intents and stops.
+  const payables = ledger.payablesForInvoice(invoice.id);
+  const intents: PayoutIntent[] = payables.map((payable) => ({
+    supplierId: payable.supplierId,
+    supplierName: payable.supplierName,
+    address: payable.address,
+    amount: payable.amountOwed,
+    chainId: payable.chainId,
+    tokenAddress: payable.tokenAddress,
     idempotencyKey: deriveIdempotencyKey({
-      workId: `${invoice.id}:${supplier.id}:${deliveryId}`,
-      chainId: supplier.chainId,
-      recipientAddress: supplier.address,
-      amount: supplier.amountOwed,
+      workId: `${invoice.id}:${payable.id}:${deliveryId}`,
+      chainId: payable.chainId,
+      recipientAddress: payable.address,
+      amount: payable.amountOwed,
     }),
   }));
+
+  // A matched invoice with no payables is a configuration failure, not a payout.
+  // Both branches below report it the same way, so a rehearsal cannot pass
+  // something the real run would refuse.
+  const unbillable = intents.length === 0;
+  const reasons = unbillable ? [...result.reasons, noPayablesReason(invoice.id)] : result.reasons;
+  if (unbillable) {
+    logger.error('matched invoice has no payables — nothing to pay', {
+      deliveryId,
+      invoiceId: invoice.id,
+      verdict: result.verdict,
+    });
+  }
 
   // A rehearsal stops here. It mirrors both branches below — a hold is reported as a
   // hold, a payable settlement has each payout simulated — and it writes nothing: not
   // a transaction, and not the ledger. A rehearsal that marked the invoice settled
   // would leave the real run with no open invoice to match against.
   if (deps.simulateOnly === true) {
-    if (result.verdict === 'held') {
-      logger.warn('dry run: settlement would be held for human release', {
-        deliveryId,
-        invoiceId: invoice.id,
-        confidence: result.confidence,
-      });
-      return { ...base, verdict: 'held', payouts: [], holds: intents, dryRun: true };
+    if (result.verdict === 'held' || unbillable) {
+      logger.warn(
+        unbillable
+          ? 'dry run: invoice has no payables, so there is nothing to simulate'
+          : 'dry run: settlement would be held for human release',
+        {
+          deliveryId,
+          invoiceId: invoice.id,
+          confidence: result.confidence,
+        },
+      );
+      return { ...base, reasons, verdict: 'held', payouts: [], holds: intents, dryRun: true };
     }
 
     const simulated: PayoutIntent[] = [];
@@ -287,7 +321,7 @@ export async function settle(
       failures: simulated.filter((intent) => intent.error !== undefined).length,
     });
 
-    return { ...base, payouts: simulated, holds: [], dryRun: true };
+    return { ...base, reasons, payouts: simulated, holds: [], dryRun: true };
   }
 
   // Past this point we are acting, so record that the inbound payment actually
@@ -299,14 +333,18 @@ export async function settle(
 
   // A held settlement stages the payout for a human to release; it does not move
   // money. This is the brake, and it is the reason a low-confidence match is
-  // safe to leave automated.
-  if (result.verdict === 'held') {
-    logger.warn('settlement held for human release', {
-      deliveryId,
-      invoiceId: invoice.id,
-      confidence: result.confidence,
-      reasons: result.reasons,
-    });
+  // safe to leave automated. An invoice with no payables lands here too: the
+  // inbound payment is real, but nothing may be paid on a guess about who.
+  if (result.verdict === 'held' || unbillable) {
+    logger.warn(
+      unbillable ? 'settlement held — invoice has no payables' : 'settlement held for human release',
+      {
+        deliveryId,
+        invoiceId: invoice.id,
+        confidence: result.confidence,
+        reasons,
+      },
+    );
     await ledger.recordSettlement({
       deliveryId,
       requestId: resolvedRequestId,
@@ -314,11 +352,11 @@ export async function settle(
       receivedAt: new Date().toISOString(),
       verdict: 'held',
       confidence: result.confidence,
-      reasons: result.reasons,
+      reasons,
       txHash: event.txHash,
       executionIds: [],
     });
-    return { ...base, verdict: 'held', payouts: [], holds: intents };
+    return { ...base, reasons, verdict: 'held', payouts: [], holds: intents };
   }
 
   // Attributed or matched at or above threshold: pay the suppliers.
@@ -387,11 +425,11 @@ export async function settle(
     receivedAt: new Date().toISOString(),
     verdict: result.verdict === 'attributed' ? 'attributed' : 'matched',
     confidence: result.confidence,
-    reasons: result.reasons,
+    reasons,
     txHash: event.txHash,
     executionIds,
   });
   await ledger.save();
 
-  return { ...base, payouts: executed, holds: [] };
+  return { ...base, reasons, payouts: executed, holds: [] };
 }

@@ -11,21 +11,25 @@
  * finite amount of USDC: rehearsing a payout by actually paying it would spend the
  * funds the recording needs, and then the recording would have nothing left to do.
  *
+ * It picks the first open invoice by id unless told otherwise, so it is not written
+ * around one specific fixture — with real invoices in the ledger it rehearses those.
+ *
  * What it does NOT prove: signature verification, and the fact that a real webhook
  * arrives at all. `/webhooks/request-network` covers those, and the forged-signature
  * path is covered by tests/verify.test.ts.
  *
  * Run from bridge/:
  *   pnpm exec tsx scripts/demo-rehearsal.ts
+ *   pnpm exec tsx scripts/demo-rehearsal.ts --invoice INV-4472
  *   pnpm exec tsx scripts/demo-rehearsal.ts --reference INV-9999   # the wrong-reference case
  *
- * Seed first, or INV-4471 is already settled and there is nothing to match:
+ * Seed first, or the invoice is already settled and there is nothing to match:
  *   pnpm exec tsx scripts/seed-demo.ts --reset
  */
 
 import { loadConfig } from '../src/env.ts';
 import { KeeperHubClient } from '../src/keeperhub.ts';
-import { Ledger } from '../src/ledger.ts';
+import { Ledger, type Invoice } from '../src/ledger.ts';
 import { RequestNetworkClient } from '../src/rn/client.ts';
 import { settle } from '../src/settle.ts';
 
@@ -52,16 +56,43 @@ async function main(): Promise<void> {
   const ledger = new Ledger('data/ledger.json');
   await ledger.load();
 
-  const invoice = ledger.getInvoice('INV-4471');
+  const requestedId = argValue('--invoice');
+  // Sorted, so the choice is the same on every run rather than whatever order the
+  // JSON file happens to preserve.
+  const candidates = ledger.openInvoices().sort((a, b) => (a.id < b.id ? -1 : 1));
+  const invoice: Invoice | undefined =
+    requestedId === undefined
+      ? candidates[0]
+      : ledger.getInvoice(requestedId);
+
   if (invoice === undefined) {
-    console.log('INV-4471 is not in the ledger. Run: pnpm exec tsx scripts/seed-demo.ts --reset');
+    const known = Object.values(ledger.snapshot().invoices).map((i) => i.id);
+    console.log(
+      requestedId === undefined
+        ? 'No open invoice is in the ledger. Run: pnpm exec tsx scripts/seed-demo.ts --reset'
+        : `Invoice ${requestedId} is not in the ledger. Known: ${known.join(', ') || '(none)'}. ` +
+            `Seed with: pnpm exec tsx scripts/seed-demo.ts --reset`,
+    );
     process.exitCode = 1;
     return;
   }
+
   if (invoice.status !== 'open') {
     console.log(
-      `INV-4471 is already ${invoice.status} (settled ${invoice.settledAmount}). ` +
+      `${invoice.id} is already ${invoice.status} (settled ${invoice.settledAmount}). ` +
         `Re-seed for a clean rehearsal: pnpm exec tsx scripts/seed-demo.ts --reset`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const payables = ledger.payablesForInvoice(invoice.id);
+  if (payables.length === 0) {
+    // The same configuration failure `settle()` refuses to pay through. Caught here
+    // so the message names the fix instead of the run looking like a verdict.
+    console.log(
+      `${invoice.id} has no payables, so there is nothing to simulate. Register them with ` +
+        `POST /invoices or scripts/add-invoice.ts.`,
     );
     process.exitCode = 1;
     return;
@@ -69,14 +100,15 @@ async function main(): Promise<void> {
 
   const payer = invoice.knownPayerAddresses[0];
   if (payer === undefined) {
-    throw new Error('INV-4471 has no known payer address, so the payer signal cannot fire.');
+    throw new Error(`${invoice.id} has no known payer address, so the payer signal cannot fire.`);
   }
 
   // A synthetic request id by default. `settle()` reads the request back from Request
   // Network for its reference, and an id we do not own fails that read — which is a
   // path worth exercising, and it leaves `reference` undefined exactly like a payment
   // that arrived without one.
-  const requestId = argValue('--request-id') ?? '01demo0000000000000000000000000000000000000000000000000000rehearsal';
+  const requestId =
+    argValue('--request-id') ?? '01demo0000000000000000000000000000000000000000000000000000rehearsal';
   // Passing --reference bypasses that read entirely: it is the "payer sent the wrong
   // reference" case, and setting it here is the one place this script stands in for
   // Request Network rather than going through it.
@@ -85,6 +117,7 @@ async function main(): Promise<void> {
   console.log(`${BOLD}TrueUp — settlement rehearsal${RESET}\n`);
   console.log(`  invoice     : ${invoice.id} — ${invoice.amount} ${invoice.currency} from ${invoice.customer}`);
   console.log(`  outstanding : ${invoice.settledAmount} settled of ${invoice.amount}`);
+  console.log(`  payables    : ${payables.length} (${payables.map((p) => p.id).join(', ')})`);
   console.log(`  payer       : ${payer}`);
   console.log(`  requestId   : ${requestId}`);
   console.log(`  reference   : ${reference ?? '(none — matching on signals only)'}`);
@@ -148,7 +181,7 @@ async function main(): Promise<void> {
   const settledAfter = `${invoice.settledAmount}/${invoice.status}`;
   const untouched = settledBefore === settledAfter;
   console.log(`\n${BOLD}--- state ---${RESET}`);
-  console.log(`  ledger INV-4471 : ${settledBefore} -> ${settledAfter} ${untouched ? '(unchanged)' : '(CHANGED — BUG)'}`);
+  console.log(`  ledger ${invoice.id} : ${settledBefore} -> ${settledAfter} ${untouched ? '(unchanged)' : '(CHANGED — BUG)'}`);
   console.log(`  signed          : no`);
   console.log(`  broadcast       : no`);
   console.log(`  value moved     : none`);
@@ -156,6 +189,15 @@ async function main(): Promise<void> {
   const failed = outcome.payouts.filter((payout) => payout.error !== undefined);
   if (!untouched) {
     console.log('\nA rehearsal mutated the ledger. That would break the real run.');
+    process.exitCode = 1;
+    return;
+  }
+  if (outcome.verdict !== 'matched' && outcome.verdict !== 'attributed') {
+    console.log(
+      `\nThe rehearsal classified this settlement as ${outcome.verdict.toUpperCase()}, so the ` +
+        `real run would not pay either. That is the brake working, or a fixture problem — ` +
+        `the reasons above say which.`,
+    );
     process.exitCode = 1;
     return;
   }

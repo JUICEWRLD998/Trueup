@@ -12,8 +12,9 @@ import {
   compareDecimalStrings,
   Ledger,
   type Invoice,
+  type Payable,
 } from '../src/ledger.ts';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -160,5 +161,99 @@ describe('Ledger', () => {
     await ledger.appendExecutionId('delivery_2', 'exec_a');
     await ledger.appendExecutionId('delivery_2', 'exec_a');
     expect(ledger.recordForDelivery('delivery_2')?.executionIds).toEqual(['exec_a']);
+  });
+});
+
+describe('payables', () => {
+  function payable(overrides: Partial<Payable> = {}): Payable {
+    return {
+      id: 'PAY-1-A',
+      invoiceId: 'INV-1',
+      supplierId: 'SUP-A',
+      supplierName: 'Cascade Carriers',
+      address: '0xC0FFEE0000000000000000000000000000000001',
+      amountOwed: '6.00',
+      chainId: '11155111',
+      tokenAddress: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',
+      ...overrides,
+    };
+  }
+
+  it('reads payables through their invoice and nowhere else', () => {
+    // The property the whole payout path depends on. A supplier can appear on more
+    // than one invoice; the payable, not the supplier, is what carries the binding.
+    const ledger = new Ledger(join(tmpdir(), 'unused.json'));
+    ledger.addPayable(payable());
+    ledger.addPayable(payable({ id: 'PAY-2-A', invoiceId: 'INV-2', amountOwed: '15.00' }));
+
+    expect(ledger.payablesForInvoice('INV-1').map((p) => p.id)).toEqual(['PAY-1-A']);
+    expect(ledger.payablesForInvoice('INV-2').map((p) => p.id)).toEqual(['PAY-2-A']);
+    expect(ledger.payablesForInvoice('INV-3')).toEqual([]);
+  });
+
+  it('replaces an invoice\u2019s payables without touching another invoice\u2019s', () => {
+    const ledger = new Ledger(join(tmpdir(), 'unused.json'));
+    ledger.addPayable(payable());
+    ledger.addPayable(payable({ id: 'PAY-2-A', invoiceId: 'INV-2' }));
+
+    ledger.setPayablesForInvoice('INV-1', [payable({ id: 'PAY-1-B', amountOwed: '18.00' })]);
+
+    expect(ledger.payablesForInvoice('INV-1').map((p) => p.id)).toEqual(['PAY-1-B']);
+    expect(ledger.payablesForInvoice('INV-2').map((p) => p.id)).toEqual(['PAY-2-A']);
+  });
+
+  it('sums an invoice\u2019s payables exactly, not in floating point', () => {
+    const ledger = new Ledger(join(tmpdir(), 'unused.json'));
+    ledger.addPayable(payable({ amountOwed: '0.1' }));
+    ledger.addPayable(payable({ id: 'PAY-1-B', amountOwed: '0.2' }));
+
+    // 0.1 + 0.2 === 0.30000000000000004 in float arithmetic.
+    expect(ledger.payablesTotalForInvoice('INV-1')).toBe('0.300000');
+  });
+
+  it('drops v1 supplier rows on load, and says so', async () => {
+    // A v1 row carried no invoiceId, so there is no honest way to place it. Paying it
+    // against whatever settles next would be worse than dropping it; dropping it
+    // silently would be worse still.
+    const dir = await mkdtemp(join(tmpdir(), 'trueup-v1-'));
+    const path = join(dir, 'ledger.json');
+    await writeFile(
+      path,
+      JSON.stringify({
+        suppliers: {
+          'SUP-CARRIER': {
+            id: 'SUP-CARRIER',
+            name: 'Cascade Carriers',
+            address: '0xC0FFEE0000000000000000000000000000000001',
+            amountOwed: '6.00',
+            chainId: '11155111',
+            tokenAddress: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',
+          },
+        },
+      }),
+      'utf8',
+    );
+
+    const ledger = new Ledger(path);
+    await ledger.load();
+
+    expect(ledger.payablesForInvoice('INV-1')).toEqual([]);
+    expect(ledger.snapshot().payables).toEqual({});
+    expect(ledger.migrationNotes().join(' ')).toMatch(/dropped 1 unbound supplier row/);
+  });
+
+  it('records no migration note for a current file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'trueup-v2-'));
+    const path = join(dir, 'ledger.json');
+    const first = new Ledger(path);
+    await first.load();
+    first.addPayable(payable());
+    await first.save();
+
+    const second = new Ledger(path);
+    await second.load();
+
+    expect(second.migrationNotes()).toEqual([]);
+    expect(second.payablesForInvoice('INV-1')).toHaveLength(1);
   });
 });

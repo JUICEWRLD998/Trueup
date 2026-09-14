@@ -29,6 +29,16 @@ export interface Config {
     matchAutoApproveThreshold: number;
     /** Rehearse the whole path without signing, broadcasting, or writing state. */
     dryRun: boolean;
+    /**
+     * Shared secret for the operator-facing endpoints (`POST/GET /invoices`, and
+     * the KeeperHub workflow callback).
+     *
+     * Deliberately optional-with-no-fallback: when it is unset those endpoints
+     * refuse with 503 rather than running unauthenticated. An intake endpoint that
+     * anyone who can reach the port may write to is a way to have this service pay
+     * an arbitrary address.
+     */
+    adminToken: string | undefined;
   };
 }
 
@@ -101,6 +111,7 @@ export const EnvSchema = z.object({
 
   BRIDGE_PORT: withDefault(z.coerce.number().int().positive().max(65535).default(8787)),
   BRIDGE_PUBLIC_URL: optional(z.string().url()),
+  BRIDGE_ADMIN_TOKEN: optional(z.string().min(16, 'must be at least 16 characters')),
   BRIDGE_DRY_RUN: boolFlag(false),
   MATCH_AUTO_APPROVE_THRESHOLD: withDefault(
     z.coerce.number().min(0).max(1).default(0.85),
@@ -172,6 +183,7 @@ export function loadConfig(envPath?: string): Config {
       publicUrl: env.BRIDGE_PUBLIC_URL,
       matchAutoApproveThreshold: env.MATCH_AUTO_APPROVE_THRESHOLD,
       dryRun: env.BRIDGE_DRY_RUN,
+      adminToken: env.BRIDGE_ADMIN_TOKEN,
     },
   };
 }
@@ -200,6 +212,11 @@ export function describeReadiness(config: Config): string[] {
   lines.push(config.rn.destinationId ? 'ok   RN_DESTINATION_ID' : 'MISS RN_DESTINATION_ID');
   lines.push(config.kh.apiKey ? 'ok   KH_API_KEY' : 'MISS KH_API_KEY');
   lines.push(config.kh.orgWallet ? 'ok   KH_ORG_WALLET' : 'MISS KH_ORG_WALLET');
+  lines.push(
+    config.bridge.adminToken
+      ? 'ok   BRIDGE_ADMIN_TOKEN'
+      : 'warn BRIDGE_ADMIN_TOKEN unset — POST/GET /invoices and the KeeperHub callback will refuse (503)',
+  );
   // Stated unconditionally, and first thing an operator reads, because a service
   // running in rehearsal mode still classifies and still reports a verdict — it just
   // never moves money. That is exactly the state worth being loud about.

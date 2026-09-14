@@ -40,7 +40,10 @@ recording, and add a little Sepolia ETH for gas, or accept that the take is once
 2. `pnpm exec tsx scripts/balance.ts` — confirm gas **and** USDC, in that order.
 3. Bridge up (`pnpm dev`) and reachable:
    `curl -s localhost:8787/readyz` must list **ok** for `RN_CLIENT_ID`,
-   `RN_WEBHOOK_SECRET`, `KH_API_KEY`, `KH_ORG_WALLET`.
+   `RN_WEBHOOK_SECRET`, `KH_API_KEY`, `KH_ORG_WALLET`. `BRIDGE_ADMIN_TOKEN` may read
+   `warn` — the recording does not use the intake API, and leaving it unset keeps
+   `POST /invoices` disabled (503) rather than open. Set it if you want to register an
+   invoice over HTTP instead of with `scripts/add-invoice.ts`.
 4. Public URL up, and RN can reach it. The tunnel is ephemeral — a `cloudflared`
    restart changes the hostname and the registered webhook URL goes stale, so
    re-register if you restart it.
@@ -79,7 +82,14 @@ so it cannot spend by accident.
 
 `seed-demo.ts --reset` matters more than it looks: seeding is deliberately
 non-destructive, so an invoice left `settled` by an earlier run stays settled and the
-money shot has nothing to settle.
+money shot has nothing to settle. Re-running it without `--reset` now **skips** a
+settled invoice rather than rewriting it — intake refuses to rewrite an obligation the
+settlement records already point at.
+
+Both intake paths (`POST /invoices` and `scripts/add-invoice.ts`) validate a payload
+with the same rules, so a real invoice and this fixture are held to one standard. If a
+rehearsal ever says an invoice has *no payables*, that is the old demo-book shape: run
+`seed-demo.ts --reset`, which now binds every payable to its invoice.
 
 ---
 

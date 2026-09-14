@@ -1,10 +1,19 @@
 /**
  * HTTP entry point.
  *
- * This layer does three things and nothing else: read the raw bytes, verify the
- * signature over those exact bytes, and hand a verified event to the settlement
- * orchestrator. All the interesting logic lives in `settle.ts` and `classify.ts`
- * so that it can be tested without a socket.
+ * Routes:
+ *   POST /webhooks/request-network   Request Network's signed settlement webhook
+ *                                    (HMAC over the raw bytes — no shared token)
+ *   POST /invoices                   register a receivable and its payables
+ *   GET  /invoices                   read the book back
+ *   POST /webhooks/keeperhub-fallback  a workflow asking the engine to decide
+ *   GET  /healthz, /readyz           liveness and configuration
+ *
+ * The webhook path verifies an HMAC signature over the exact bytes it received.
+ * Every other non-public route requires `x-trueup-admin-token` to match
+ * `BRIDGE_ADMIN_TOKEN`; when that variable is unset they refuse with 503 rather
+ * than running open. The settlement logic lives in `settle.ts`, `classify.ts` and
+ * `intake.ts` so it can be tested without a socket.
  *
  * Response codes are chosen around Request Network's retry behaviour (3 retries,
  * 4 attempts, at 1s / 5s / 15s):
@@ -13,19 +22,33 @@
  *   500 — we failed transiently. Let them retry.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { z } from 'zod';
 import { loadConfig, describeReadiness, requireSecret, type Config } from './env.ts';
+import { IntakeError, IntakeRequestSchema, registerInvoice } from './intake.ts';
 import { KeeperHubClient } from './keeperhub.ts';
-import { Ledger } from './ledger.ts';
+import { Ledger, type Invoice } from './ledger.ts';
 import { RequestNetworkClient } from './rn/client.ts';
 import { GenericEventSchema, PaymentConfirmedSchema } from './rn/types.ts';
 import { isTestDelivery, readDeliveryId, readHeader, SIGNATURE_HEADER, verifySignature } from './rn/verify.ts';
 import { settle, type Logger, type SettleDeps } from './settle.ts';
 
 const MAX_BODY_BYTES = 1_000_000;
+
+/** The admin token header. Named so the operator can see it in logs and docs. */
+const ADMIN_HEADER = 'x-trueup-admin-token';
+
+/**
+ * The intake body is the invoice payload plus one control flag. Declared here
+ * rather than in `intake.ts` because "create the Request Network request too" is
+ * a property of the HTTP call, not of what an invoice is.
+ */
+const IntakeBodySchema = IntakeRequestSchema.extend({
+  createPaymentRequest: z.boolean().optional(),
+});
 
 function consoleLogger(): Logger {
   return {
@@ -66,6 +89,57 @@ export interface ServerDeps {
   readonly logger: Logger;
 }
 
+/**
+ * Constant-time comparison of two secrets.
+ *
+ * Both sides are hashed first so the buffers are always 32 bytes: `timingSafeEqual`
+ * throws on a length mismatch, and a length check would itself leak the length of
+ * the expected token. Hashing also means a long or short guess costs the same.
+ */
+function tokenMatches(provided: string | undefined, expected: string): boolean {
+  if (provided === undefined || provided.length === 0) {
+    return false;
+  }
+  const a = createHash('sha256').update(provided).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Guards the operator-facing routes. Returns false when a response was already
+ * sent, so callers write `if (!requireAdmin(...)) return;`.
+ *
+ * An unset token disables the routes (503) rather than opening them. The intake
+ * endpoint decides who gets paid, so "nobody configured a token" must not mean
+ * "anyone who can reach the port may register a payout address".
+ */
+function requireAdmin(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): boolean {
+  const expected = deps.config.bridge.adminToken;
+  if (expected === undefined || expected.length === 0) {
+    deps.logger.error('refused an operator request: BRIDGE_ADMIN_TOKEN is not configured', {
+      path: req.url,
+    });
+    sendJson(res, 503, {
+      error: 'admin_api_disabled',
+      detail:
+        'BRIDGE_ADMIN_TOKEN is not set, so the operator API is disabled rather than open. ' +
+        'Set it in .env and restart the bridge.',
+    });
+    return false;
+  }
+  if (!tokenMatches(readHeader(req.headers, ADMIN_HEADER), expected)) {
+    deps.logger.warn('rejected an operator request with a missing or wrong token', {
+      path: req.url,
+    });
+    sendJson(res, 401, {
+      error: 'invalid_admin_token',
+      detail: `Send the value of BRIDGE_ADMIN_TOKEN in the ${ADMIN_HEADER} header.`,
+    });
+    return false;
+  }
+  return true;
+}
+
 export function createServer(deps: ServerDeps) {
   return createHttpServer((req, res) => {
     void handleRequest(req, res, deps).catch((error: unknown) => {
@@ -96,11 +170,127 @@ async function handleRequest(
     return;
   }
 
+  // --- The book: register a receivable, or read it back. -------------------
+  // This is the product's input path. Before it existed, the only way an invoice
+  // and its payables reached the ledger was the demo seed reading a fixture file.
+  if (url === '/invoices' || url.startsWith('/invoices?') || url.startsWith('/invoices/')) {
+    if (!requireAdmin(req, res, deps)) {
+      return;
+    }
+
+    if (req.method === 'GET') {
+      const state = deps.ledger.snapshot();
+      sendJson(res, 200, {
+        invoices: Object.values(state.invoices).map((invoice) => ({
+          id: invoice.id,
+          customer: invoice.customer,
+          amount: invoice.amount,
+          currency: invoice.currency,
+          reference: invoice.reference,
+          status: invoice.status,
+          settledAmount: invoice.settledAmount,
+          rnRequestId: invoice.rnRequestId ?? null,
+          payables: deps.ledger.payablesForInvoice(invoice.id).map((payable) => ({
+            id: payable.id,
+            supplierId: payable.supplierId,
+            supplierName: payable.supplierName,
+            address: payable.address,
+            amountOwed: payable.amountOwed,
+            chainId: payable.chainId,
+            tokenAddress: payable.tokenAddress ?? null,
+          })),
+        })),
+        settlements: Object.values(state.deliveries),
+      });
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed', allow: 'GET, POST' });
+      return;
+    }
+
+    const raw = await readRawBody(req);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw.toString('utf8'));
+    } catch {
+      sendJson(res, 400, { error: 'invalid_json' });
+      return;
+    }
+
+    const body = IntakeBodySchema.safeParse(parsed);
+    if (!body.success) {
+      sendJson(res, 422, {
+        error: 'invalid_invoice_payload',
+        issues: body.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`),
+      });
+      return;
+    }
+
+    const { createPaymentRequest, ...intakeRequest } = body.data;
+
+    try {
+      const result = await registerInvoice(intakeRequest, {
+        ledger: deps.ledger,
+        createRequest:
+          createPaymentRequest === true
+            ? async (invoice: Invoice) => {
+                const created = await deps.rn.createSecurePayment({
+                  // Omit destinationId when unset so the bound destination resolves.
+                  ...(deps.config.rn.destinationId === undefined
+                    ? {}
+                    : { destinationId: deps.config.rn.destinationId }),
+                  amount: invoice.amount,
+                  reference: invoice.reference,
+                });
+                const first = created.requestIds[0];
+                if (first === undefined) {
+                  throw new Error('Request Network returned no request id');
+                }
+                return first;
+              }
+            : undefined,
+      });
+
+      deps.logger.info('registered an invoice', {
+        invoiceId: result.invoice.id,
+        payables: result.payables.length,
+        notes: result.notes,
+      });
+
+      sendJson(res, 201, {
+        ok: true,
+        invoice: result.invoice,
+        payables: result.payables,
+        notes: result.notes,
+      });
+    } catch (error) {
+      if (error instanceof IntakeError) {
+        // 422: the payload is well-formed but not payable. Every reason is listed.
+        deps.logger.warn('refused an invoice', { errors: error.errors });
+        sendJson(res, 422, { error: 'invoice_refused', reasons: error.errors });
+        return;
+      }
+      deps.logger.error('invoice intake failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      sendJson(res, 502, {
+        error: 'invoice_intake_failed',
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return;
+  }
+
   // KeeperHub workflow callback. A workflow that decides an inbound payment is
   // unattributed POSTs here, so the reconciliation engine — not a workflow
   // Condition — makes the attribution decision. This keeps the judgement in
   // tested TypeScript rather than in a graph, which is the whole design.
   if (req.method === 'POST' && url.startsWith('/webhooks/keeperhub-fallback')) {
+    if (!requireAdmin(req, res, deps)) {
+      return;
+    }
     const raw = await readRawBody(req);
     let parsed: unknown;
     try {
@@ -263,6 +453,11 @@ async function main(): Promise<void> {
   const logger = consoleLogger();
   const ledger = new Ledger('data/ledger.json');
   await ledger.load();
+  // Loud, because a migrated ledger is missing payables it used to have, and the
+  // only symptom otherwise is a settlement that holds instead of paying.
+  for (const note of ledger.migrationNotes()) {
+    logger.warn(note);
+  }
 
   const kh = new KeeperHubClient({
     apiBase: config.kh.apiBase,

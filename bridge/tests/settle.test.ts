@@ -1,7 +1,7 @@
 /**
  * Settlement orchestration tests.
  *
- * The cases that justify this file, both of which are about refusing to do damage:
+ * The cases that justify this file, all of which are about refusing to do damage:
  *
  *   1. A rehearsal must write NOTHING. A dry run that marked the invoice settled
  *      would leave the real run with nothing to settle — the demo would be spent
@@ -10,18 +10,22 @@
  *      Omitting `tokenAddress` does not fail at the API; it silently becomes a native
  *      transfer of the same nominal amount. Paying a supplier 6 ETH because a 6 USDC
  *      payout lost its token address is the worst available outcome.
+ *   3. Payouts follow the MATCHED invoice's payables. Paying from a flat supplier
+ *      list means settling one invoice pays another invoice's counterparties, which
+ *      is the one bug in this product that moves real money to the wrong party.
  */
 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { Ledger, type Invoice, type Supplier } from '../src/ledger.ts';
+import { Ledger, type Invoice, type Payable } from '../src/ledger.ts';
 import { settle, type Logger } from '../src/settle.ts';
 import type { KeeperHubClient } from '../src/keeperhub.ts';
 import type { RequestNetworkClient } from '../src/rn/client.ts';
 import type { PaymentConfirmed } from '../src/rn/types.ts';
 
 const SEPOLIA_USDC = '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238';
+const PAYER = '0xA11CE0000000000000000000000000000000dEAd';
 
 function silentLogger(): Logger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
@@ -41,15 +45,17 @@ function invoice(overrides: Partial<Invoice> = {}): Invoice {
     settledAmount: '0.00',
     settledAt: undefined,
     txHash: undefined,
-    knownPayerAddresses: ['0xA11CE0000000000000000000000000000000dEAd'],
+    knownPayerAddresses: [PAYER],
     ...overrides,
   };
 }
 
-function supplier(overrides: Partial<Supplier> = {}): Supplier {
+function payable(overrides: Partial<Payable> = {}): Payable {
   return {
-    id: 'SUP-CARRIER',
-    name: 'Cascade Carriers',
+    id: 'PAY-4471-CARRIER',
+    invoiceId: 'INV-4471',
+    supplierId: 'SUP-CARRIER',
+    supplierName: 'Cascade Carriers',
     address: '0xC0FFEE0000000000000000000000000000000001',
     amountOwed: '6.00',
     chainId: '11155111',
@@ -58,12 +64,12 @@ function supplier(overrides: Partial<Supplier> = {}): Supplier {
   };
 }
 
-async function makeLedger(invoices: Invoice[], suppliers: Supplier[]): Promise<Ledger> {
+async function makeLedger(invoices: Invoice[], payables: Payable[]): Promise<Ledger> {
   const path = join(tmpdir(), `trueup-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   const ledger = new Ledger(path);
   await ledger.load();
   for (const value of invoices) ledger.addInvoice(value);
-  for (const value of suppliers) ledger.addSupplier(value);
+  for (const value of payables) ledger.addPayable(value);
   return ledger;
 }
 
@@ -74,7 +80,7 @@ function event(overrides: Partial<PaymentConfirmed> = {}): PaymentConfirmed {
     amount: '18.00',
     totalAmountPaid: '18.00',
     expectedAmount: '18.00',
-    payerAddress: '0xA11CE0000000000000000000000000000000dEAd',
+    payerAddress: PAYER,
     txHash: '0xdeadbeef',
     timestamp: '1789000000',
     ...overrides,
@@ -108,7 +114,7 @@ const rn = { getRequest: () => Promise.resolve({ reference: undefined }) } as un
 
 describe('a rehearsal', () => {
   it('simulates each payout and broadcasts none of them', async () => {
-    const ledger = await makeLedger([invoice()], [supplier()]);
+    const ledger = await makeLedger([invoice()], [payable()]);
     const { kh, simulated, broadcast } = fakeKh();
 
     const outcome = await settle(event(), 'delivery_1', {
@@ -132,7 +138,7 @@ describe('a rehearsal', () => {
   it('leaves the ledger exactly as it found it', async () => {
     // The property the demo depends on. If a rehearsal settles the invoice, the real
     // run has nothing to settle and the recording is wasted.
-    const ledger = await makeLedger([invoice()], [supplier()]);
+    const ledger = await makeLedger([invoice()], [payable()]);
     const { kh } = fakeKh();
 
     await settle(event(), 'delivery_1', {
@@ -151,7 +157,7 @@ describe('a rehearsal', () => {
   });
 
   it('reports a hold without recording it either', async () => {
-    const ledger = await makeLedger([invoice()], [supplier()]);
+    const ledger = await makeLedger([invoice()], [payable()]);
     const { kh, simulated } = fakeKh();
 
     const outcome = await settle(
@@ -177,7 +183,7 @@ describe('a rehearsal', () => {
   });
 
   it('sends the token address, so the simulation cannot pass as a native transfer', async () => {
-    const ledger = await makeLedger([invoice()], [supplier()]);
+    const ledger = await makeLedger([invoice()], [payable()]);
     const { kh, simulated } = fakeKh();
 
     await settle(event(), 'delivery_1', {
@@ -195,7 +201,7 @@ describe('a rehearsal', () => {
 
 describe('a payout that must not be attempted', () => {
   it('refuses a payout with no token address instead of sending native value', async () => {
-    const ledger = await makeLedger([invoice()], [supplier({ tokenAddress: undefined })]);
+    const ledger = await makeLedger([invoice()], [payable({ tokenAddress: undefined })]);
     const { kh, simulated, broadcast } = fakeKh();
 
     const outcome = await settle(event(), 'delivery_1', {
@@ -212,7 +218,10 @@ describe('a payout that must not be attempted', () => {
   });
 
   it('refuses a payout above the per-transaction cap without calling KeeperHub', async () => {
-    const ledger = await makeLedger([invoice({ amount: '4200.00' })], [supplier({ amountOwed: '1200.00' })]);
+    const ledger = await makeLedger(
+      [invoice({ amount: '4200.00' })],
+      [payable({ amountOwed: '1200.00' })],
+    );
     const { kh, broadcast } = fakeKh();
 
     const outcome = await settle(
@@ -226,9 +235,64 @@ describe('a payout that must not be attempted', () => {
   });
 });
 
+describe('an invoice with nothing to pay', () => {
+  it('holds instead of reporting a settled invoice, and says why', async () => {
+    // A matched invoice with no payables is a configuration failure. Recording it as
+    // a success would lose an obligation with no error anywhere, so it is recorded
+    // as held, with the reason the operator needs.
+    const ledger = await makeLedger([invoice()], []);
+    const { kh, broadcast } = fakeKh();
+    const logger = silentLogger();
+
+    const outcome = await settle(event(), 'delivery_1', {
+      ledger,
+      kh,
+      rn,
+      logger,
+      autoApproveThreshold: 0.85,
+    });
+
+    expect(outcome.verdict).toBe('held');
+    expect(outcome.payouts).toHaveLength(0);
+    expect(outcome.reasons.join(' ')).toMatch(/no payables configured/);
+    expect(broadcast).toHaveLength(0);
+
+    const record = ledger.snapshot().deliveries['delivery_1'];
+    expect(record?.verdict).toBe('held');
+    expect(record?.reasons.join(' ')).toMatch(/no payables configured/);
+    // The inbound payment is real, so the invoice is not left looking unpaid while
+    // the record says it was handled.
+    expect(ledger.getInvoice('INV-4471')?.status).toBe('settled');
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('reports it in a rehearsal too, without writing anything', async () => {
+    const ledger = await makeLedger([invoice()], []);
+    const { kh, simulated } = fakeKh();
+
+    const outcome = await settle(event(), 'delivery_1', {
+      ledger,
+      kh,
+      rn,
+      logger: silentLogger(),
+      autoApproveThreshold: 0.85,
+      simulateOnly: true,
+    });
+
+    expect(outcome.verdict).toBe('held');
+    expect(outcome.dryRun).toBe(true);
+    expect(outcome.reasons.join(' ')).toMatch(/no payables configured/);
+    expect(simulated).toHaveLength(0);
+    expect(ledger.snapshot().deliveries).toEqual({});
+  });
+});
+
 describe('a real run', () => {
   it('broadcasts with the token address and records the execution ids', async () => {
-    const ledger = await makeLedger([invoice()], [supplier(), supplier({ id: 'SUP-FUEL', amountOwed: '4.30' })]);
+    const ledger = await makeLedger(
+      [invoice()],
+      [payable(), payable({ id: 'PAY-4471-FUEL', supplierId: 'SUP-FUEL', amountOwed: '4.30' })],
+    );
     const { kh, broadcast } = fakeKh();
 
     const outcome = await settle(event(), 'delivery_1', {
@@ -241,7 +305,7 @@ describe('a real run', () => {
 
     expect(broadcast).toHaveLength(2);
     expect(broadcast[0]?.['tokenAddress']).toBe(SEPOLIA_USDC);
-    // The idempotency key is derived per supplier, so a retry of one payout cannot
+    // The idempotency key is derived per payable, so a retry of one payout cannot
     // suppress another.
     const keys = new Set(broadcast.map((call) => call['idempotencyKey']));
     expect(keys.size).toBe(2);
@@ -251,8 +315,38 @@ describe('a real run', () => {
     expect(ledger.getInvoice('INV-4471')?.status).toBe('settled');
   });
 
+  it('pays only the matched invoice\u2019s payables, even when a supplier appears on another', async () => {
+    // SUP-CARRIER owes on both invoices. A lookup that ignored the invoice would pay
+    // the carrier twice, from one settlement.
+    const ledger = await makeLedger(
+      [invoice(), invoice({ id: 'INV-4472', amount: '15.00', reference: 'INV-4472' })],
+      [
+        payable(),
+        payable({ id: 'PAY-4472-CARRIER', invoiceId: 'INV-4472', amountOwed: '15.00' }),
+      ],
+    );
+    const { kh, broadcast } = fakeKh();
+
+    const outcome = await settle(event(), 'delivery_1', {
+      ledger,
+      kh,
+      rn,
+      logger: silentLogger(),
+      // The payer has two open invoices, so INV-4471 loses the uniqueness credit and
+      // scores 0.95 rather than 1.0 — still enough to act on at the default bar.
+      autoApproveThreshold: 0.85,
+    });
+
+    expect(broadcast).toHaveLength(1);
+    expect(broadcast[0]?.['amount']).toBe('6.00');
+    expect(broadcast[0]?.['recipientAddress']).toBe('0xC0FFEE0000000000000000000000000000000001');
+    expect(outcome.payouts.map((p) => p.supplierId)).toEqual(['SUP-CARRIER']);
+    expect(outcome.payouts[0]?.amount).toBe('6.00');
+    expect(ledger.getInvoice('INV-4472')?.status).toBe('open');
+  });
+
   it('does not re-pay when the same delivery is submitted twice', async () => {
-    const ledger = await makeLedger([invoice()], [supplier()]);
+    const ledger = await makeLedger([invoice()], [payable()]);
     const { kh, broadcast } = fakeKh();
     const deps = { ledger, kh, rn, logger: silentLogger(), autoApproveThreshold: 0.85 };
 

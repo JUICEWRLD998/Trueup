@@ -1,5 +1,5 @@
 {
-  "$comment": "Seed data for the demo and for tests. Deliberately shaped so the interesting cases are reachable: INV-4471 is the unattributed payment, INV-4472 shares a payer with INV-4471 so the ambiguity guard has something to fire on, and INV-4473 is the clean control case with a correct reference.",
+  "$comment": "Seed data for the demo and for tests. Deliberately shaped so the interesting cases are reachable: INV-4471 is the unattributed payment, INV-4472 shares a payer with INV-4471 so the ambiguity guard has something to fire on, and INV-4473 is the clean control case with a correct reference. Every payable names the invoice that funds it (invoiceId) — and SUP-CARRIER appears on both INV-4471 and INV-4472 on purpose, so a lookup that ignored the invoice would visibly pay the wrong counterparty.",
   "$amounts": "Figures are deliberately small. KeeperHub bounds a single stablecoin outflow at 100 USD and our Sepolia org wallet holds ~19 USDC, so a 4,200 invoice with 1,200/860/2,140 supplier payouts cannot be paid on any write path — each supplier would be refused by the per-call cap before a signature was ever produced (verified live 2026-09-13: HTTP 400, 'exceeds the 100.00 USD per-transaction limit'). Scaling by 1/100 keeps the three-supplier structure, the two-party ambiguity, and the batch-payout centrepiece reachable with the funds actually available. tests/fixtures.test.ts enforces these invariants so a re-scale cannot silently break the demo again.",
   "invoices": [
     {
@@ -30,31 +30,57 @@
       "reference": "INV-4473",
       "issuedAt": "2026-08-20T00:00:00.000Z",
       "dueAt": "2026-09-19T00:00:00.000Z",
-      "knownPayerAddresses": ["0xB0b0000000000000000000000000000000000F00D"]
+      "knownPayerAddresses": ["0xB0b000000000000000000000000000000000F00D"]
     }
   ],
-  "suppliers": [
+  "payables": [
     {
-      "id": "SUP-CARRIER",
-      "name": "Cascade Carriers",
+      "id": "PAY-4471-CARRIER",
+      "invoiceId": "INV-4471",
+      "supplierId": "SUP-CARRIER",
+      "supplierName": "Cascade Carriers",
       "address": "0xC0FFEE0000000000000000000000000000000001",
       "amountOwed": "6.00",
       "chainId": "11155111",
       "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     },
     {
-      "id": "SUP-FUEL",
-      "name": "Pike Fuel Services",
+      "id": "PAY-4471-FUEL",
+      "invoiceId": "INV-4471",
+      "supplierId": "SUP-FUEL",
+      "supplierName": "Pike Fuel Services",
       "address": "0xC0FFEE0000000000000000000000000000000002",
       "amountOwed": "4.30",
       "chainId": "11155111",
       "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     },
     {
-      "id": "SUP-WAREHOUSE",
-      "name": "Dockside Warehousing",
+      "id": "PAY-4471-WAREHOUSE",
+      "invoiceId": "INV-4471",
+      "supplierId": "SUP-WAREHOUSE",
+      "supplierName": "Dockside Warehousing",
       "address": "0xC0FFEE0000000000000000000000000000000003",
       "amountOwed": "7.70",
+      "chainId": "11155111",
+      "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+    },
+    {
+      "id": "PAY-4472-CARRIER",
+      "invoiceId": "INV-4472",
+      "supplierId": "SUP-CARRIER",
+      "supplierName": "Cascade Carriers",
+      "address": "0xC0FFEE0000000000000000000000000000000001",
+      "amountOwed": "15.00",
+      "chainId": "11155111",
+      "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+    },
+    {
+      "id": "PAY-4473-SECURITY",
+      "invoiceId": "INV-4473",
+      "supplierId": "SUP-SECURITY",
+      "supplierName": "Irongate Security",
+      "address": "0xC0FFEE0000000000000000000000000000000004",
+      "amountOwed": "9.80",
       "chainId": "11155111",
       "tokenAddress": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     }

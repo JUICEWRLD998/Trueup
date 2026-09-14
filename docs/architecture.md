@@ -21,9 +21,44 @@ The gap between those two statements is the product.
 
 ---
 
+## Where an invoice and its payables come from
+
+An invoice enters the book through `POST /invoices` (or `scripts/add-invoice.ts`),
+which both call `registerInvoice()` in `src/intake.ts`. Intake is the only writer:
+one implementation of the rules, so the CLI and the HTTP endpoint cannot disagree
+about what is payable.
+
+A **payable** is one payout obligation — who gets paid, how much, on which chain, in
+which token — and it always names the invoice that funds it. The same supplier can
+appear on several invoices, so the binding lives on the payable, not on the party.
+
+The rules are all refusals, and each exists because the alternative moves money
+wrongly:
+
+| Refusal | What it prevents |
+| --- | --- |
+| no `tokenAddress` on a payable | a silent NATIVE transfer of the same nominal amount under a far smaller cap |
+| a payout above 100 USD | a settlement that half-pays: nothing above the platform cap is ever signed |
+| payables that do not sum to the invoice | an obligation left stranded, or paying out more than was collected |
+| a currency the cap is not defined for | paying past a limit we cannot state |
+| re-registering a **settled** invoice | rewriting an obligation the settlement records already reference |
+
+The invoice binding is the one that matters most. An earlier version read payables
+from a flat list with no invoice on it, so settling any invoice paid every
+counterparty in the book — the single mistake in this product that sends real money
+to the wrong party. `Ledger.payablesForInvoice(invoiceId)` now takes the invoice id as
+a required argument and always filters, and a matched invoice with **no** payables is
+recorded as `held` with a reason rather than as a settlement that quietly paid nobody.
+
+---
+
 ## Data flow
 
 ```
+operator ──registers invoice + payables──► trueup-bridge ──► the book
+                                          (POST /invoices)    invoices · payables
+                                                              references · payers
+                                                                   │
 payer ──settles USDC──► Request Network ──HMAC-signed webhook──► trueup-bridge
                                                                        │
                                               ┌────────────────────────┤
@@ -45,8 +80,8 @@ payer ──settles USDC──► Request Network ──HMAC-signed webhook─�
                         │                                 │                      │
                   ≥ 0.85 confident               0.55 – 0.85               < 0.55
                         │                                 │                      │
-                   pay suppliers                    Sign & Hold            move nothing
-                   (dry run first)                  for release            alert a human
+              pay the invoice's payables          Sign & Hold            move nothing
+                   (dry run first)                for release            alert a human
                         │                                 │                      │
                         └─────────────────────────────────┴──────────────────────┘
                                                           │
@@ -181,6 +216,12 @@ control flow. `unconfirmed` is non-terminal — it is still settling.
 `data/ledger.json`, written atomically via temp file and rename, with writes
 serialised inside the process. No native dependency, no migration, and a judge can
 read the state directly.
+
+The file carries a version. Version 2 moved payables under the invoice that funds
+them; a v1 file's supplier rows named no invoice at all, so they are **dropped on
+load with a loud note** rather than guessed at — paying a row against whichever
+invoice settles next is exactly the failure the binding exists to prevent. The
+operator re-registers those invoices through intake.
 
 This is a deliberate five-day-build choice and it is named as a limitation in
 `limits.md`. The production swap is Postgres with a unique constraint on the

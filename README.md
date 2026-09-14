@@ -52,13 +52,16 @@ Nothing is inferred at execution time. That is the whole point.
                                         ▼
                         ┌──────────────────────────────────────┐
                         │  trueup-bridge  (Node 24 / TS)       │
+                        │  0. intake: POST /invoices           │
+                        │       the book — invoices + payables │
+                        │       (validated, invoice-bound)     │
                         │  1. verify HMAC over RAW body        │
                         │  2. persist event (idempotency)      │
                         │  3. classify:                        │
                         │       reference ok → record          │
                         │       unattributed → match           │
                         │       partial      → stage hold      │
-                        │  4. call KeeperHub                   │
+                        │  4. pay THIS invoice's payables      │
                         └───────────────┬──────────────────────┘
                                         │ REST direct execution / MCP
                                         ▼
@@ -158,10 +161,16 @@ Reproduce it with `pnpm exec tsx scripts/first-transaction.ts` from `bridge/`.
 
 ## Status
 
-**Phase 2 — closing the loop.** The bridge is built and covered by **143 tests**
-across 10 files, and `pnpm type-check` is clean. Phase 1 executed a real transfer
+**Phase 2 — closing the loop.** The bridge is built and covered by **177 tests**
+across 12 files, and `pnpm type-check` is clean. Phase 1 executed a real transfer
 through KeeperHub; Phase 2 added the receipt bundle, a whole-loop dry run, and the
 payout path's missing token handling.
+
+The product's own input path is built too: receivables arrive through
+`POST /invoices` (or `scripts/add-invoice.ts`), which validate and register them
+through one implementation, and every payout obligation **names the invoice that
+funds it** — so a settlement pays that invoice's payables and nobody else's. See
+`bridge/README.md` for the rules intake refuses on.
 
 The full loop can be rehearsed today without moving anything:
 
@@ -190,10 +199,12 @@ See [`implementation.md`](./implementation.md) for the plan and
 | Webhook signature verification (HMAC over raw bytes) | **built** — 14 tests |
 | Reconciliation engine (weighted, explainable, refuses to guess) | **built** — 19 tests |
 | ERC-7828 destination parsing | **built** — 12 tests |
-| Ledger + delivery idempotency | **built** — 12 tests |
+| Ledger + delivery idempotency | **built** — 17 tests |
+| Invoice intake (`POST /invoices`, CLI, one shared validator) | **built** — 22 tests |
+| Payables bound to their invoice | **built** — pinned by a settle test |
 | KeeperHub client (dry run enforced before every broadcast) | **built** — 17 tests |
 | Request Network API client | **built** — payment creation and read-back verified live |
-| HTTP bridge (`/webhooks/request-network`, `/readyz`) | **built**, smoke-tested |
+| HTTP bridge (`/webhooks/request-network`, `/invoices`, `/readyz`) | **built**, smoke-tested; operator routes behind `BRIDGE_ADMIN_TOKEN` |
 | Receipt bundle | **built** — 23 tests; not yet wired to a run |
 | Whole-loop dry run (`BRIDGE_DRY_RUN`) | **built** — run live against KeeperHub |
 | KeeperHub workflows W1–W4 | not built |
@@ -225,12 +236,22 @@ cd bridge
 pnpm install
 cp ../.env.example .env   # then fill it in — never commit .env
 
-pnpm test         # 143 tests
+pnpm test         # 177 tests
 pnpm type-check
 pnpm dev          # starts the bridge; GET /readyz lists which keys are missing
 ```
 
-Seed the demo data with `pnpm exec tsx scripts/seed-demo.ts`.
+Then put something real in the book:
+
+```bash
+pnpm exec tsx scripts/seed-demo.ts            # the demo's three invoices
+# or register your own:
+pnpm exec tsx scripts/add-invoice.ts my-invoice.json --create-request
+```
+
+`add-invoice.ts` and `POST /invoices` share one validator, so a payload either passes
+both or neither. `POST /invoices` needs `BRIDGE_ADMIN_TOKEN` set; the CLI writes to the
+ledger directly and needs no token.
 
 Nothing runs end to end yet — the live path needs Request Network and KeeperHub
 credentials. `GET /readyz` names exactly which are absent.

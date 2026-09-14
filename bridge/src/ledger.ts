@@ -1,5 +1,5 @@
 /**
- * Ledger — invoices, settlements, and the idempotency record that stops a
+ * Ledger — invoices, their payables, and the idempotency record that stops a
  * redelivered webhook from paying a supplier twice.
  *
  * Storage is an append-only JSON file written atomically (temp file + rename).
@@ -33,9 +33,24 @@ export interface Invoice {
   readonly knownPayerAddresses: string[];
 }
 
-export interface Supplier {
+/**
+ * One payout obligation: money an invoice owes to a counterparty once that
+ * invoice is settled.
+ *
+ * The invoice binding is the load-bearing field. A payable that carried no
+ * `invoiceId` — or a lookup that ignored the invoice — means settling any
+ * invoice pays whichever counterparties happen to be in the book, which is the
+ * one mistake in this product that moves real money to the wrong party.
+ * `Ledger.payablesForInvoice` is the only way to read them, and it always
+ * filters.
+ */
+export interface Payable {
   readonly id: string;
-  readonly name: string;
+  /** The invoice whose settlement funds this payout. */
+  readonly invoiceId: string;
+  /** The counterparty that gets paid. */
+  readonly supplierId: string;
+  readonly supplierName: string;
   /** Payout address. */
   readonly address: string;
   /** Amount owed, as a decimal string. */
@@ -59,16 +74,30 @@ export interface SettlementRecord {
 }
 
 export interface LedgerState {
+  /** Bumped when the shape changes, so a stale file is migrated rather than misread. */
+  version: number;
   invoices: Record<string, Invoice>;
-  suppliers: Record<string, Supplier>;
+  /** Keyed by payable id. Every payable names the invoice that funds it. */
+  payables: Record<string, Payable>;
   /** Keyed by delivery id. Presence means the delivery has been handled. */
   deliveries: Record<string, SettlementRecord>;
   /** Keyed by Request Network request id, for lookups from a payload. */
   requestIndex: Record<string, string>;
 }
 
+/**
+ * 2 — payables are invoice-bound.
+ *
+ * Version 1 stored a flat `suppliers` map with no invoice on it, so a settlement
+ * paid every counterparty in the book. Those records cannot be migrated: there
+ * is no information in them that says which invoice they belonged to. Guessing
+ * would pay the wrong party, so they are dropped with a note and the operator
+ * re-registers the invoice through the intake path.
+ */
+export const LEDGER_STATE_VERSION = 2;
+
 function emptyState(): LedgerState {
-  return { invoices: {}, suppliers: {}, deliveries: {}, requestIndex: {} };
+  return { version: LEDGER_STATE_VERSION, invoices: {}, payables: {}, deliveries: {}, requestIndex: {} };
 }
 
 export class Ledger {
@@ -76,6 +105,8 @@ export class Ledger {
   private readonly path: string;
   /** Serialises writes so two concurrent deliveries cannot interleave. */
   private writeChain: Promise<void> = Promise.resolve();
+  /** Anything the loader had to do to the file to read it. Logged at startup. */
+  private readonly notes: string[] = [];
 
   constructor(path: string) {
     this.path = path;
@@ -84,10 +115,23 @@ export class Ledger {
   async load(): Promise<void> {
     try {
       const raw = await readFile(this.path, 'utf8');
-      const parsed = JSON.parse(raw) as Partial<LedgerState>;
+      const parsed = JSON.parse(raw) as Partial<LedgerState> & { suppliers?: Record<string, unknown> };
+      const legacySuppliers = Object.keys(parsed.suppliers ?? {}).length;
+      if (legacySuppliers > 0) {
+        // Version 1 rows carry no invoiceId, so there is no honest way to place them.
+        // Paying them against the next invoice that settles would be worse than
+        // dropping them, and dropping them silently would be worse still.
+        this.notes.push(
+          `migrated ledger to v${LEDGER_STATE_VERSION}: dropped ${legacySuppliers} unbound ` +
+            `supplier row(s) from v${String(parsed.version ?? 1)} — they named no invoice, so they ` +
+            `could not be attached to one. Re-register those invoices via POST /invoices ` +
+            `or scripts/add-invoice.ts.`,
+        );
+      }
       this.state = {
+        version: LEDGER_STATE_VERSION,
         invoices: parsed.invoices ?? {},
-        suppliers: parsed.suppliers ?? {},
+        payables: parsed.payables ?? {},
         deliveries: parsed.deliveries ?? {},
         requestIndex: parsed.requestIndex ?? {},
       };
@@ -98,6 +142,11 @@ export class Ledger {
       }
       throw error;
     }
+  }
+
+  /** Notes produced by `load()`. Empty on a healthy file. */
+  migrationNotes(): readonly string[] {
+    return this.notes;
   }
 
   private async persist(): Promise<void> {
@@ -173,14 +222,51 @@ export class Ledger {
     }
   }
 
-  // --- suppliers ----------------------------------------------------------
+  // --- payables -----------------------------------------------------------
 
-  addSupplier(supplier: Supplier): void {
-    this.state.suppliers[supplier.id] = supplier;
+  addPayable(payable: Payable): void {
+    this.state.payables[payable.id] = payable;
   }
 
-  suppliersForInvoice(): Supplier[] {
-    return Object.values(this.state.suppliers);
+  /**
+   * The payables funded by one invoice. Always filtered by invoice — this is the
+   * signature that makes paying the wrong counterparty impossible to write by
+   * accident, so it takes the invoice id as a required argument.
+   *
+   * Sorted by id so a settlement's payouts are produced in a stable order: the
+   * same settlement replayed produces the same sequence, which is what makes the
+   * audit trail readable.
+   */
+  payablesForInvoice(invoiceId: string): Payable[] {
+    return Object.values(this.state.payables)
+      .filter((payable) => payable.invoiceId === invoiceId)
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }
+
+  /** Replaces every payable for an invoice. Used by intake, which is an upsert. */
+  setPayablesForInvoice(invoiceId: string, payables: readonly Payable[]): void {
+    this.removePayablesForInvoice(invoiceId);
+    for (const payable of payables) {
+      this.addPayable(payable);
+    }
+  }
+
+  removePayablesForInvoice(invoiceId: string): number {
+    const doomed = Object.values(this.state.payables).filter(
+      (payable) => payable.invoiceId === invoiceId,
+    );
+    for (const payable of doomed) {
+      delete this.state.payables[payable.id];
+    }
+    return doomed.length;
+  }
+
+  /** Exact decimal sum of an invoice's payables. Compared with `compareDecimalStrings`. */
+  payablesTotalForInvoice(invoiceId: string): string {
+    return this.payablesForInvoice(invoiceId).reduce(
+      (total, payable) => addDecimalStrings(total, payable.amountOwed),
+      '0.00',
+    );
   }
 
   // --- settlements / idempotency -----------------------------------------
